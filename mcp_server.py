@@ -2,7 +2,9 @@
 """MCP server wrapping papertrade — gives Claude Code tool access to the paper broker."""
 
 import contextlib
+import functools
 import io
+import inspect
 import json
 import os
 import sqlite3
@@ -430,6 +432,16 @@ def cancel_order(
         source=agent,
         request_id=idempotency_key,
     )
+
+
+@mcp.tool()
+def order_cancel(
+    order_id: int,
+    idempotency_key: str | None = None,
+    agent: str = "mcp",
+) -> str:
+    """Cancel one pending order by id; canonical counterpart to order_cancel_all."""
+    return cancel_order(order_id, idempotency_key=idempotency_key, agent=agent)
 
 
 @mcp.tool()
@@ -1227,6 +1239,212 @@ def forex_rate(pair: str) -> str:
         return json.dumps(pt.latest_quote(f"{normalized}=X"), indent=2)
     except SystemExit as exc:
         return f"error: {exc}"
+
+
+LEGACY_MCP_TOOLS = frozenset(
+    {
+        "buy",
+        "sell",
+        "close_position",
+        "watchlist",
+        "cancel_order",
+        "quote",
+        "trade_history",
+    }
+)
+
+CORE_MCP_TOOLS = frozenset(
+    {
+        "mcp_catalog",
+        "account_create",
+        "account_list",
+        "account_details",
+        "get_default_account",
+        "set_default_account",
+        "rename_account",
+        "summary",
+        "deposit",
+        "withdraw",
+        "risk_get",
+        "risk_set",
+        "preview_order",
+        "orders",
+        "order_submit",
+        "order_get",
+        "order_replace",
+        "order_cancel",
+        "order_cancel_all",
+        "positions",
+        "position_get",
+        "position_close",
+        "position_close_all",
+        "pnl",
+        "performance",
+        "portfolio_backtest",
+        "tick",
+        "asset_search",
+        "validate_symbol",
+        "bulk_quotes",
+        "market_status",
+        "trading_calendar",
+        "market_latest_quote",
+        "market_snapshot",
+        "market_bars",
+        "market_news",
+        "market_most_actives",
+        "market_movers",
+        "buy_option",
+        "sell_option",
+        "option_chain",
+        "option_contract",
+        "futures_symbols",
+        "watchlist_create",
+        "watchlist_list",
+        "watchlist_get",
+        "watchlist_add",
+        "watchlist_remove",
+        "watchlist_delete",
+        "watchlist_quotes",
+        "account_activity",
+        "audit_log",
+        "healthcheck",
+        "database_backup",
+    }
+)
+
+ACTIVE_MCP_PROFILE = ""
+ACTIVE_MCP_RESPONSE_FORMAT = ""
+ACTIVE_MCP_TOOLS = frozenset()
+
+
+@mcp.tool()
+def mcp_catalog() -> str:
+    """Describe the active catalog, response contract, profiles, and legacy aliases."""
+    return json.dumps(
+        {
+            "profile": ACTIVE_MCP_PROFILE,
+            "response_format": ACTIVE_MCP_RESPONSE_FORMAT,
+            "tool_count": len(ACTIVE_MCP_TOOLS),
+            "tools": sorted(ACTIVE_MCP_TOOLS),
+            "profiles": {
+                "core": "Focused default without destructive account tools or duplicate aliases.",
+                "advanced": "Every canonical capability, including destructive and specialist tools.",
+                "full": "Advanced plus all legacy compatibility aliases.",
+                "compat": "Alias for full, with legacy responses by default.",
+            },
+            "legacy_aliases": {
+                "buy": "order_submit",
+                "sell": "order_submit",
+                "close_position": "position_close",
+                "watchlist": "bulk_quotes",
+                "cancel_order": "order_cancel",
+                "quote": "market_latest_quote",
+                "trade_history": "orders",
+            },
+        },
+        indent=2,
+    )
+
+
+def _json_payload(result):
+    if not isinstance(result, str):
+        return result
+    stripped = result.strip()
+    if not stripped:
+        return ""
+    try:
+        return json.loads(stripped)
+    except (TypeError, json.JSONDecodeError):
+        return result
+
+
+def _json_success(result):
+    return json.dumps(
+        {"ok": True, "data": _json_payload(result)},
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _json_error(message, code="tool_error"):
+    return json.dumps(
+        {"ok": False, "error": {"code": code, "message": str(message)}},
+        separators=(",", ":"),
+    )
+
+
+def _wrap_json_tool(tool):
+    original = tool.fn
+    if inspect.iscoroutinefunction(original):
+
+        @functools.wraps(original)
+        async def async_wrapped(*args, **kwargs):
+            try:
+                result = await original(*args, **kwargs)
+            except SystemExit as exc:
+                return _json_error(exc)
+            except Exception as exc:
+                return _json_error(exc, "internal_error")
+            if isinstance(result, str) and result.strip().lower().startswith("error:"):
+                return _json_error(result.strip()[6:].strip())
+            return _json_success(result)
+
+        tool.fn = async_wrapped
+        return
+
+    @functools.wraps(original)
+    def wrapped(*args, **kwargs):
+        try:
+            result = original(*args, **kwargs)
+        except SystemExit as exc:
+            return _json_error(exc)
+        except Exception as exc:
+            return _json_error(exc, "internal_error")
+        if isinstance(result, str) and result.strip().lower().startswith("error:"):
+            return _json_error(result.strip()[6:].strip())
+        return _json_success(result)
+
+    tool.fn = wrapped
+
+
+def _configure_mcp_catalog():
+    global ACTIVE_MCP_PROFILE, ACTIVE_MCP_RESPONSE_FORMAT, ACTIVE_MCP_TOOLS
+
+    requested = os.environ.get("PAPERTRADE_MCP_PROFILE", "core").strip().lower()
+    profile = "full" if requested == "compat" else requested
+    if profile not in {"core", "advanced", "full"}:
+        raise RuntimeError(
+            "PAPERTRADE_MCP_PROFILE must be core, advanced, full, or compat"
+        )
+    default_format = "legacy" if profile == "full" else "json"
+    response_format = (
+        os.environ.get("PAPERTRADE_MCP_RESPONSE_FORMAT", default_format).strip().lower()
+    )
+    if response_format not in {"json", "legacy"}:
+        raise RuntimeError("PAPERTRADE_MCP_RESPONSE_FORMAT must be json or legacy")
+
+    available = set(mcp._tool_manager._tools)
+    missing = CORE_MCP_TOOLS - available
+    if missing:
+        raise RuntimeError(f"core MCP tools were not registered: {sorted(missing)}")
+    if profile == "core":
+        allowed = set(CORE_MCP_TOOLS)
+    elif profile == "advanced":
+        allowed = available - LEGACY_MCP_TOOLS
+    else:
+        allowed = available
+    for name in available - allowed:
+        mcp.remove_tool(name)
+
+    ACTIVE_MCP_PROFILE = profile
+    ACTIVE_MCP_RESPONSE_FORMAT = response_format
+    ACTIVE_MCP_TOOLS = frozenset(allowed)
+    if response_format == "json":
+        for tool in mcp._tool_manager._tools.values():
+            _wrap_json_tool(tool)
+
+
+_configure_mcp_catalog()
 
 
 if __name__ == "__main__":

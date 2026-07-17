@@ -96,12 +96,30 @@ Start the MCP server over standard input/output:
 python3 mcp_server.py
 ```
 
-The MCP server exposes 71 tools, including `portfolio_backtest`, the complete order lifecycle,
-partial and full liquidation, option exercise/DNE and multi-leg strategies,
-persistent watchlist CRUD, activities, calendar, market history, news,
-screeners, crypto indications, FX rates, health checks, and backups. Mutating
-tools accept agent attribution and idempotency keys for safe retries from
-multiple independent MCP processes.
+The server defaults to a focused 54-tool `core` catalog. It uses canonical
+names, includes `portfolio_backtest`, order preview and lifecycle management,
+positions, watchlists, market data, health checks, and backups, and leaves
+destructive account deletion/reset out of the default agent surface. Core
+responses use one compact JSON contract: `{"ok":true,"data":...}` or
+`{"ok":false,"error":{"code":"...","message":"..."}}`.
+
+Select a broader catalog before starting the server when an agent needs it:
+
+```bash
+PAPERTRADE_MCP_PROFILE=advanced python3 mcp_server.py  # 66 canonical tools
+PAPERTRADE_MCP_PROFILE=full python3 mcp_server.py      # all 73, legacy output
+```
+
+`advanced` adds destructive and specialist option/research/data operations.
+`full` adds the seven old aliases (`buy`, `sell`, `cancel_order`,
+`close_position`, `quote`, `trade_history`, and `watchlist`) for existing
+clients; `compat` is an alias for `full`. Set
+`PAPERTRADE_MCP_RESPONSE_FORMAT=json|legacy` to override a profile's response
+format. The `mcp_catalog` tool reports the active contract and complete tool
+list.
+
+Mutating tools accept agent attribution and idempotency keys for safe retries
+from multiple independent MCP processes.
 
 Portfolio data defaults to `~/.papertrade.db`. Set `PAPERTRADE_DB` to use a
 different database path.
@@ -120,6 +138,7 @@ python3 test_backtesting.py
 python3 test_performance.py
 python3 test_concurrency.py
 python3 test_mcp_server.py
+python3 test_mcp_profiles.py
 python3 test_dashboard.py
 python3 test_alpaca_parity.py
 python3 test_cli.py

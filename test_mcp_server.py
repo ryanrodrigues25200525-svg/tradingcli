@@ -7,6 +7,8 @@ import tempfile
 
 
 os.environ["PAPERTRADE_DB"] = tempfile.mktemp(suffix=".db")
+os.environ["PAPERTRADE_MCP_PROFILE"] = "full"
+os.environ["PAPERTRADE_MCP_RESPONSE_FORMAT"] = "legacy"
 
 import mcp_server as mcp
 
@@ -36,6 +38,7 @@ required = {
     "order_submit",
     "order_get",
     "order_replace",
+    "order_cancel",
     "order_cancel_all",
     "position_get",
     "position_close",
@@ -64,9 +67,11 @@ required = {
     "market_movers",
     "market_crypto_orderbook",
     "forex_rate",
+    "mcp_catalog",
 }
 names = set(mcp.mcp._tool_manager._tools)
 assert required <= names, required - names
+assert len(names) == 73, names
 
 created = mcp.account_create("agent", 10_000, idempotency_key="create-1", agent="codex")
 assert created.startswith("created")
@@ -123,6 +128,10 @@ replacement = mcp.order_replace(
     advanced_order["id"], limit_price=96, client_order_id="advanced-2"
 )
 assert "replaced" in replacement
+replacement_order = json.loads(
+    mcp.order_get(client_order_id="advanced-2", account="agent")
+)
+assert "canceled" in mcp.order_cancel(replacement_order["id"], agent="codex")
 
 assert "created watchlist" in mcp.watchlist_create(
     "agent", "Tech", "AAPL,MSFT", idempotency_key="watch-1", agent="codex"
@@ -140,6 +149,8 @@ health = json.loads(mcp.healthcheck())
 assert health["status"] == "ok" and health["schema_version"] == 3
 clock = json.loads(mcp.market_status())
 assert clock["market"] == "NYSE" and clock["status"] in ("open", "closed")
+catalog = json.loads(mcp.mcp_catalog())
+assert catalog["profile"] == "full" and catalog["tool_count"] == 73
 
 conn = mcp.pt.db()
 with mcp.pt.writing(conn):
