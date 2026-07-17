@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+
+# Local trading state and SQLite sidecars must never be committed.
+.papertrade.db*
+*.db
+*.db-shm
+*.db-wal
+

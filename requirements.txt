@@ -1,0 +1,7 @@
+exchange-calendars
+mcp
+numpy
+pandas
+rich
+yfinance
+
