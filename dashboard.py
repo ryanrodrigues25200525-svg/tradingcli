@@ -30,30 +30,33 @@ LOGO = "▀█▀ █▀█ ▄▀█ █▀▄ █ █▄ █ █▀▀ █▀�
 
 def snapshot(account_filter=None):
     conn = pt.db()
-    where, params = ("WHERE name=?", (account_filter,)) if account_filter else ("", ())
-    accounts = conn.execute(
-        f"SELECT name, cash FROM accounts {where}", params
-    ).fetchall()
+    if account_filter:
+        accounts = conn.execute(
+            "SELECT name,cash,deposits,realized FROM accounts WHERE name=?",
+            (account_filter,),
+        ).fetchall()
+    else:
+        accounts = conn.execute(
+            "SELECT name,cash,deposits,realized FROM accounts"
+        ).fetchall()
     default = (
         conn.execute("SELECT value FROM config WHERE key='default_account'").fetchone()
         or [None]
     )[0]
     data, symbols = [], set()
-    for name, cash in accounts:
-        dep, real = conn.execute(
-            "SELECT deposits, realized FROM accounts WHERE name=?", (name,)
-        ).fetchone()
+    for name, cash, dep, real in accounts:
         pos = conn.execute(
             "SELECT symbol, qty, avg_cost, mult, asset_class, margin"
             " FROM positions WHERE account=?",
             (name,),
         ).fetchall()
         pend = conn.execute(
-            "SELECT id, side, qty, symbol, limit_price FROM orders"
+            "SELECT id,side,qty,symbol,order_type,limit_price,stop_price,"
+            "trail_price,trail_percent,time_in_force FROM orders"
             " WHERE account=? AND status='pending'",
             (name,),
         ).fetchall()
-        symbols |= {s for s, *_ in pos} | {s for _, _, _, s, _ in pend}
+        symbols |= {s for s, *_ in pos} | {order[3] for order in pend}
         data.append((name, cash, dep, real, pos, pend))
     conn.close()
     return data, symbols, default
@@ -113,9 +116,26 @@ def _pct(frac):
     return f"[{c}]{frac * 100:+.2f}%[/{c}]"
 
 
+def _pending_order_label(order):
+    oid, side, qty, symbol, kind, limit, stop, trail, trail_pct, tif = order
+    if kind == "limit":
+        trigger = f"lim {limit:.2f}"
+    elif kind == "stop":
+        trigger = f"stop {stop:.2f}"
+    elif kind == "stop_limit":
+        trigger = f"stop {stop:.2f} / lim {limit:.2f}"
+    elif kind == "trailing_stop":
+        configured = f"{trail:.2f}" if trail is not None else f"{trail_pct:.2f}%"
+        trigger = f"trail {configured}"
+        if stop is not None:
+            trigger += f" (stop {stop:.2f})"
+    else:
+        trigger = kind
+    return f"#{oid} {side} {qty:g} {symbol} {trigger} {tif}"
+
+
 def render(data, quotes, default, prev=None):
     prev = prev or {}
-    total_equity = total_upnl = total_day = 0.0
     panels = []
     for name, cash, deposits, realized, pos, pend in data:
         t = Table(
@@ -137,7 +157,18 @@ def render(data, quotes, default, prev=None):
             side = "[green]LONG[/green]" if qty > 0 else f"[{RED}]SHORT[/{RED}]"
             q = quotes.get(sym)
             if q is None:
-                t.add_row(sym, side, f"{abs(qty):g}", f"{avg:.2f}", "?", "?", "?", "?")
+                fallback = margin if ac == "future" else qty * mult * avg
+                equity += fallback
+                t.add_row(
+                    sym,
+                    side,
+                    f"{abs(qty):g}",
+                    f"{avg:.2f}",
+                    "?",
+                    f"~{fallback:,.2f}",
+                    "?",
+                    "?",
+                )
                 continue
             px, prev_close = q
             upnl = qty * mult * (px - avg)
@@ -170,9 +201,6 @@ def render(data, quotes, default, prev=None):
             )
         if not pos:
             t.add_row("[dim]no positions[/dim]", "", "", "", "", "", "", "")
-        total_equity += equity
-        total_upnl += upnl_sum
-        total_day += day_sum
         total_pnl = realized + upnl_sum
         ret_pct = (total_pnl / deposits * 100) if deposits else 0.0
         stats = Table.grid(expand=True)
@@ -188,9 +216,7 @@ def render(data, quotes, default, prev=None):
         )
         parts = [t, "", stats]
         if pend:
-            lines = ", ".join(
-                f"#{i} {side} {q:g} {s} lim {lp:.2f}" for i, side, q, s, lp in pend
-            )
+            lines = ", ".join(_pending_order_label(order) for order in pend)
             parts.append(f"[yellow]◌ pending:[/yellow] {lines}")
         star = " ★" if name == default else ""
         panels.append(
@@ -427,7 +453,11 @@ def prompt_option(console):
     except ValueError:
         console.print(f"  [{RED}]not a number, aborted[/{RED}]")
         return
-    occ = pt.build_occ(underlying, expiry, strike, kind)
+    try:
+        occ = pt.build_occ(underlying, expiry, strike, kind)
+    except SystemExit as e:
+        console.print(f"  [{RED}]{e}[/{RED}]")
+        return
     conn = pt.db()
     try:
         with conn:

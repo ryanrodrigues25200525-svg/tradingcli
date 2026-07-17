@@ -144,4 +144,8 @@ python3 test_mcp_profiles.py
 python3 test_dashboard.py
 python3 test_alpaca_parity.py
 python3 test_cli.py
+python3 test_edge_cases.py
+python3 test_market_data.py
+python3 test_mcp_features.py
+python3 test_invariants.py
 ```

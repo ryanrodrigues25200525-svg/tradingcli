@@ -214,25 +214,30 @@ def summary() -> str:
         "FROM positions ORDER BY account,symbol"
     ).fetchall()
     conn.close()
-    positions_by_account = {name: [] for name, *_ in accounts}
+    positions_by_account: dict[str, list[tuple]] = {name: [] for name, *_ in accounts}
     for account, *position in positions:
         positions_by_account.setdefault(account, []).append(position)
     marks = pt.batch_prices([position[1] for position in positions], ignore_errors=True)
     out = []
     for name, cash, dep, real in accounts:
-        eq, unreal, npos = cash, 0.0, 0
+        eq, unreal, npos, approximate = cash, 0.0, 0, False
         for sym, qty, avg, mult, ac, margin in positions_by_account.get(name, []):
             npos += 1
             px = marks.get(sym)
             if px is None:
+                # Preserve a useful approximate equity value during a quote outage.
+                eq += margin if ac == "future" else qty * mult * avg
+                approximate = True
                 continue
             u = qty * mult * (px - avg)
             unreal += u
             eq += (u + margin) if ac == "future" else qty * mult * px
         total = real + unreal
         ret = total / dep * 100 if dep else 0.0
+        equity_prefix = "~" if approximate else ""
         out.append(
-            f"{name}: equity {eq:,.2f}  cash {cash:,.2f}  unreal {unreal:+,.2f}  "
+            f"{name}: equity {equity_prefix}{eq:,.2f}  cash {cash:,.2f}  "
+            f"unreal {unreal:+,.2f}  "
             f"total {total:+,.2f} ({ret:+.2f}%)  {npos} positions"
         )
     return "\n".join(out) or "no accounts"
@@ -1315,7 +1320,7 @@ CORE_MCP_TOOLS = frozenset(
 
 ACTIVE_MCP_PROFILE = ""
 ACTIVE_MCP_RESPONSE_FORMAT = ""
-ACTIVE_MCP_TOOLS = frozenset()
+ACTIVE_MCP_TOOLS: frozenset[str] = frozenset()
 
 
 @mcp.tool()

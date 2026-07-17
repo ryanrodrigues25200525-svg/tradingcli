@@ -83,6 +83,41 @@ order = json.loads(
 )
 assert order["order_type"] == "stop_limit" and order["client_order_id"] == "cli-order-1"
 
+# cancel-all defaults to the selected account; cross-account cancellation is explicit.
+run("new", "other", "--cash", "25000")
+run(
+    "order",
+    "submit",
+    "AMZN",
+    "--side",
+    "buy",
+    "--qty",
+    "1",
+    "--type",
+    "limit",
+    "--limit-price",
+    "50",
+    "--client-order-id",
+    "other-order-1",
+    "--account",
+    "other",
+)
+run("use", "cli")
+run("order", "cancel-all")
+cli_order = json.loads(
+    run("order", "get", "--client-order-id", "cli-order-1", "--json").stdout
+)
+other_orders = json.loads(
+    run("order", "list", "--account", "other", "--status", "all", "--json").stdout
+)
+assert cli_order["status"] == "canceled"
+assert other_orders[0]["status"] == "pending"
+run("order", "cancel-all", "--all-accounts")
+other_orders = json.loads(
+    run("order", "list", "--account", "other", "--status", "all", "--json").stdout
+)
+assert other_orders[0]["status"] == "canceled"
+
 run("watchlist", "create", "Tech", "--symbols", "AAPL,MSFT")
 watchlist = json.loads(run("watchlist", "get", "Tech", "--json").stdout)
 assert watchlist["symbols"] == ["AAPL", "MSFT"]

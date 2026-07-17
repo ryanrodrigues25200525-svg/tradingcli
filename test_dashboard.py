@@ -3,6 +3,7 @@
 import os
 import sys
 import tempfile
+from types import SimpleNamespace
 
 
 os.environ["PAPERTRADE_DB"] = tempfile.mktemp(suffix=".db")
@@ -128,10 +129,14 @@ captured = {}
 original_performance = dashboard.pt.account_performance
 original_cache = pbt.YahooHistoryCache
 original_backtest = pbt.run_portfolio_backtest
-dashboard.pt.account_performance = lambda *_args, **_kwargs: (
-    [("2026-01-01", 25_000), ("2026-01-02", 25_000)],
-    None,
-)
+
+
+def fake_performance(*_args, **kwargs):
+    kwargs["closes_fn"](["AAPL"], "2026-01-01", "2026-01-02")
+    return [("2026-01-01", 25_000), ("2026-01-02", 25_000)], None
+
+
+dashboard.pt.account_performance = fake_performance
 pbt.YahooHistoryCache = lambda: type(
     "HistoryCache",
     (),
@@ -164,5 +169,133 @@ finally:
 
 assert captured["account"] == "main"
 assert captured["lookback_days"] == 3650
+
+# Quote outages retain cost-basis equity, and every pending order type renders safely.
+recording = Console(record=True, width=150, color_system=None)
+recording.print(
+    dashboard.render(
+        [
+            (
+                "main",
+                24_900,
+                25_000,
+                0,
+                [("MSFT", 1, 100, 1, "spot", 0)],
+                [
+                    (1, "sell", 1, "MSFT", "stop", None, 95, None, None, "gtc"),
+                    (
+                        2,
+                        "sell",
+                        1,
+                        "MSFT",
+                        "trailing_stop",
+                        None,
+                        94,
+                        None,
+                        5,
+                        "gtc",
+                    ),
+                ],
+            )
+        ],
+        {"MSFT": None},
+        "main",
+    )
+)
+screen = recording.export_text()
+assert "25,000.00" in screen and "~100.00" in screen
+assert "stop 95.00" in screen and "trail 5.00% (stop 94.00)" in screen
+
+
+class InvalidOptionConsole:
+    def __init__(self):
+        self.answers = iter(["", "", "AAPL", "not-a-date", "C", "100", "1", ""])
+        self.messages = []
+
+    def print(self, message="", *_args, **_kwargs):
+        self.messages.append(str(message))
+
+    def input(self, *_args, **_kwargs):
+        return next(self.answers)
+
+
+invalid_option = InvalidOptionConsole()
+dashboard.prompt_option(invalid_option)
+assert any("YYYY-MM-DD" in message for message in invalid_option.messages)
+
+
+class ActionConsole:
+    def __init__(self, answers):
+        self.answers = iter(answers)
+
+    def print(self, *_args, **_kwargs):
+        pass
+
+    def input(self, *_args, **_kwargs):
+        return next(self.answers)
+
+
+dashboard.prompt_new(ActionConsole(["other", "5000"]))
+dashboard.prompt_order(ActionConsole(["other", "AAPL", "1", "50"]), "buy")
+conn = dashboard.pt.db()
+(pending_id,) = conn.execute(
+    "SELECT id FROM orders WHERE account='other' AND status='pending'"
+).fetchone()
+conn.close()
+dashboard.prompt_rename(ActionConsole(["other", "renamed"]))
+dashboard.prompt_use(ActionConsole(["main"]))
+dashboard.prompt_cancel(ActionConsole([str(pending_id)]))
+conn = dashboard.pt.db()
+assert conn.execute("SELECT 1 FROM accounts WHERE name='renamed'").fetchone()
+assert (
+    conn.execute("SELECT value FROM config WHERE key='default_account'").fetchone()[0]
+    == "main"
+)
+assert (
+    conn.execute("SELECT status FROM orders WHERE id=?", (pending_id,)).fetchone()[0]
+    == "canceled"
+)
+conn.close()
+
+# The non-TTY read path and the full dashboard loop both return cleanly.
+assert dashboard.read_key(0) is None
+
+
+class DummyLive:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        pass
+
+    def update(self, *_args, **_kwargs):
+        pass
+
+
+saved = {
+    "Live": dashboard.Live,
+    "snapshot": dashboard.snapshot,
+    "fetch_quotes": dashboard.fetch_quotes,
+    "render": dashboard.render,
+    "read_key": dashboard.read_key,
+    "run_dashboard": dashboard.run_dashboard,
+}
+try:
+    dashboard.Live = lambda **_kwargs: DummyLive()
+    dashboard.snapshot = lambda _account=None: ([], set(), None)
+    dashboard.fetch_quotes = lambda _symbols: {}
+    dashboard.render = lambda *_args, **_kwargs: "dashboard"
+    dashboard.read_key = lambda _timeout: "q"
+    assert (
+        dashboard.run_dashboard(
+            ActionConsole([]), SimpleNamespace(account=None, interval=0.01)
+        )
+        == "quit"
+    )
+    dashboard.run_dashboard = lambda _console, _args: "quit"
+    dashboard.main()
+finally:
+    for name, value in saved.items():
+        setattr(dashboard, name, value)
 
 print("dashboard checks passed")

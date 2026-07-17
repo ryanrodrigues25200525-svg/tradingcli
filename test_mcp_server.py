@@ -169,6 +169,10 @@ original_live_price = mcp.pt.live_price
 mcp.pt.live_price = lambda symbol: {"AAPL": 100, "MSFT": 200}[symbol]
 try:
     assert "2 positions" in mcp.summary()
+    mcp.pt.live_price = lambda _symbol: (_ for _ in ()).throw(
+        SystemExit("quote unavailable")
+    )
+    assert "equity ~10,280.00" in mcp.summary()
 finally:
     mcp.pt.live_price = original_live_price
 

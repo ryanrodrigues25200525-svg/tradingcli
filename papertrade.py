@@ -20,6 +20,7 @@ import os
 import re
 import sqlite3
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -501,6 +502,9 @@ def _apply(state, symbol, side, qty, price):
             realized = closed * mult * (price - old_avg) * direction
         if old_qty * signed >= 0 and new_qty != 0:
             new_avg = (old_qty * old_avg + signed * price) / new_qty
+        elif abs(signed) > abs(old_qty):
+            # A trade that crosses zero opens the remainder at this fill price.
+            new_avg = price
         else:
             new_avg = old_avg if new_qty != 0 else 0.0
         cash -= cost
@@ -718,6 +722,8 @@ def fill(conn, account, symbol, side, qty, price):
         raise SystemExit("symbol required")
     if not math.isfinite(qty) or qty <= 0:
         raise SystemExit("quantity must be a positive finite number")
+    if classify(symbol)[0] == "option" and not math.isclose(qty, round(qty)):
+        raise SystemExit("option quantity must be a whole number")
     if not math.isfinite(price) or price < 0:
         raise SystemExit("fill price must be a non-negative finite number")
     with writing(conn):
@@ -884,6 +890,8 @@ def place(
     symbol = symbol.upper()
     if not symbol:
         raise SystemExit("symbol required")
+    if classify(symbol)[0] == "option" and not math.isclose(qty, round(qty)):
+        raise SystemExit("option quantity must be a whole number")
     if limit is not None and (not math.isfinite(limit) or limit <= 0):
         raise SystemExit("limit price must be a positive finite number")
     intent = {
@@ -1222,6 +1230,8 @@ def submit_order(
         raise SystemExit("extended hours requires a day or gtc limit order")
     if time_in_force in ("ioc", "fok") and order_type not in ("market", "limit"):
         raise SystemExit("ioc/fok is supported only for market and limit orders")
+    if time_in_force in ("ioc", "fok") and order_class != "simple":
+        raise SystemExit("ioc/fok is not supported for linked orders")
     if order_class == "bracket" and (take_profit is None or stop_loss is None):
         raise SystemExit("bracket order requires take-profit and stop-loss")
     if order_class == "oto" and (take_profit is None) == (stop_loss is None):
@@ -1729,6 +1739,12 @@ def close_position(
             raise SystemExit(f"cannot close {close_qty:g}; only {abs(open_qty):g} open")
     else:
         close_qty = abs(open_qty)
+    if (
+        classify(symbol)[0] == "option"
+        and not math.isclose(close_qty, round(close_qty))
+        and not math.isclose(close_qty, abs(open_qty))
+    ):
+        raise SystemExit("option close quantity must be a whole number")
     intent = {"account": account, "symbol": symbol, "qty": close_qty}
     existing = _existing_order(conn, source, request_id, intent, close=True)
     if existing:
@@ -1752,6 +1768,14 @@ def close_position(
         if close_qty > abs(current_qty) + 1e-9:
             raise SystemExit("position changed while close order was being prepared")
         side = "sell" if current_qty > 0 else "buy"
+        # A manual liquidation supersedes outstanding orders for this instrument.
+        # Cancel them under the same write lock so a protective exit cannot later
+        # reopen the position in the opposite direction.
+        conn.execute(
+            "UPDATE orders SET status='canceled' WHERE account=? AND symbol=?"
+            " AND status IN ('pending','held')",
+            (account, symbol),
+        )
         _fill_locked(conn, account, symbol, side, close_qty, price)
         oid = _insert_order_locked(
             conn,
@@ -2034,7 +2058,11 @@ def submit_option_multileg(
         side = str(leg.get("side", "")).lower()
         if side not in ("buy", "sell"):
             raise SystemExit("each leg side must be buy or sell")
-        qty = _positive(float(leg.get("qty", 0)), "leg quantity")
+        try:
+            raw_qty = float(leg.get("qty", 0))
+        except (TypeError, ValueError):
+            raise SystemExit("leg quantity must be a positive finite number") from None
+        qty = _positive(raw_qty, "leg quantity")
         if not math.isclose(qty, round(qty)):
             raise SystemExit("option leg quantity must be a whole number")
         clean.append({"symbol": symbol, "side": side, "qty": qty})
@@ -2132,22 +2160,36 @@ def set_default(conn, name, source="cli", request_id=None):
 def cancel(conn, oid, source="cli", request_id=None):
     source, request_id = _context(source, request_id)
     with writing(conn):
-        account_row = conn.execute(
-            "SELECT account FROM orders WHERE id=?", (oid,)
+        order = conn.execute(
+            "SELECT account,status,parent_id,order_class FROM orders WHERE id=?", (oid,)
         ).fetchone()
-        account = account_row[0] if account_row else None
+        account = order[0] if order else None
         details = {"order_id": oid}
         if _idempotent_action(
             conn, "order.cancel", account, source, request_id, details
         ):
             print(f"idempotent replay: canceled #{oid}")
             return
-        row = conn.execute("SELECT status FROM orders WHERE id=?", (oid,)).fetchone()
-        if not row:
+        if not order:
             raise SystemExit(f"no order #{oid}")
-        if row[0] not in ("pending", "held"):
-            raise SystemExit(f"order #{oid} is {row[0]}, not cancelable")
-        conn.execute("UPDATE orders SET status='canceled' WHERE id=?", (oid,))
+        status, parent_id, order_class = order[1:]
+        if status not in ("pending", "held"):
+            raise SystemExit(f"order #{oid} is {status}, not cancelable")
+        if order_class == "oco":
+            root = parent_id or oid
+            conn.execute(
+                "UPDATE orders SET status='canceled' WHERE (id=? OR parent_id=?)"
+                " AND status IN ('pending','held')",
+                (root, root),
+            )
+        elif parent_id is None:
+            conn.execute(
+                "UPDATE orders SET status='canceled' WHERE (id=? OR parent_id=?)"
+                " AND status IN ('pending','held')",
+                (oid, oid),
+            )
+        else:
+            conn.execute("UPDATE orders SET status='canceled' WHERE id=?", (oid,))
         _audit_locked(conn, "order.cancel", account, source, request_id, details)
     print(f"canceled #{oid}")
 
@@ -2296,6 +2338,18 @@ def wipe_account(conn, name, reset_cash=None, source="cli", request_id=None):
                 "DELETE FROM config WHERE key='default_account' AND value=?", (name,)
             )
             conn.execute("DELETE FROM risk_settings WHERE account=?", (name,))
+            has_default = conn.execute(
+                "SELECT 1 FROM config WHERE key='default_account'"
+            ).fetchone()
+            if not has_default:
+                fallback = conn.execute(
+                    "SELECT name FROM accounts ORDER BY name LIMIT 1"
+                ).fetchone()
+                if fallback:
+                    conn.execute(
+                        "INSERT INTO config(key,value) VALUES('default_account',?)",
+                        (fallback[0],),
+                    )
         else:
             ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
             conn.execute(
@@ -2455,6 +2509,23 @@ def _linked_after_fill_locked(conn, order):
         )
 
 
+def _linked_after_terminal_locked(conn, order):
+    """Retire linked legs when their parent or one OCO member terminates."""
+    if order["parent_id"] is None:
+        conn.execute(
+            "UPDATE orders SET status='canceled' WHERE parent_id=?"
+            " AND status IN ('pending','held')",
+            (order["id"],),
+        )
+    elif order["order_class"] == "oco":
+        root = order["parent_id"]
+        conn.execute(
+            "UPDATE orders SET status='canceled' WHERE (id=? OR parent_id=?)"
+            " AND id<>? AND status IN ('pending','held')",
+            (root, root, order["id"]),
+        )
+
+
 def tick(conn, price_fn=live_price):
     """Advance pending limit, stop, trailing, linked, and auction order state."""
     settle_expired(conn, price_fn)
@@ -2476,11 +2547,14 @@ def tick(conn, price_fn=live_price):
             and snapshot["ts"][:10] < datetime.now(timezone.utc).date().isoformat()
         ):
             with writing(conn):
-                conn.execute(
+                changed = conn.execute(
                     "UPDATE orders SET status='expired' WHERE id=? AND status='pending'",
                     (oid,),
                 )
-            print(f"expired #{oid} {snapshot['symbol']}")
+                if changed.rowcount:
+                    _linked_after_terminal_locked(conn, snapshot)
+            if changed.rowcount:
+                print(f"expired #{oid} {snapshot['symbol']}")
             continue
         try:
             price = price_fn(snapshot["symbol"])
@@ -2525,6 +2599,7 @@ def tick(conn, price_fn=live_price):
                     "UPDATE orders SET status='rejected',reject_reason=? WHERE id=? AND status='pending'",
                     (reason, oid),
                 )
+                _linked_after_terminal_locked(conn, current)
                 _audit_locked(
                     conn,
                     "order.reject",
@@ -3240,13 +3315,25 @@ def account_activities(
 def backup_database(conn, directory=None):
     directory = directory or os.path.expanduser("~/.papertrade_backups")
     os.makedirs(directory, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    path = os.path.join(directory, f"papertrade-{stamp}.db")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    descriptor, path = tempfile.mkstemp(
+        prefix=f"papertrade-{stamp}-", suffix=".db", dir=directory
+    )
+    os.close(descriptor)
     target = sqlite3.connect(path)
+    failed = False
     try:
         conn.backup(target)
+    except BaseException:
+        failed = True
+        raise
     finally:
         target.close()
+        if failed:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
     return path
 
 
@@ -3684,7 +3771,11 @@ def _build_parser():
     cancel_one.add_argument("order_id", type=int)
     cancel_one.add_argument("--idempotency-key")
     cancel_all = order_sub.add_parser("cancel-all")
-    cancel_all.add_argument("-a", "--account")
+    cancel_scope = cancel_all.add_mutually_exclusive_group()
+    cancel_scope.add_argument("-a", "--account")
+    cancel_scope.add_argument(
+        "--all-accounts", action="store_true", help="cancel across every account"
+    )
     cancel_all.add_argument("--idempotency-key")
 
     position = sub.add_parser("position", help="position lookup and liquidation")
@@ -4120,7 +4211,10 @@ def _run_cli(args):
             elif args.order_cmd == "cancel":
                 cancel(conn, args.order_id, request_id=args.idempotency_key)
             else:
-                cancel_all_orders(conn, args.account, request_id=args.idempotency_key)
+                account = (
+                    None if args.all_accounts else resolve_account(conn, args.account)
+                )
+                cancel_all_orders(conn, account, request_id=args.idempotency_key)
         elif args.cmd == "position":
             account = resolve_account(conn, args.account)
             if args.position_cmd == "list":
