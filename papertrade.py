@@ -20,6 +20,7 @@ import os
 import re
 import sqlite3
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 
@@ -3303,37 +3304,80 @@ def pnl(conn, account, price_fn=live_price):
 
 def _daily_closes(symbols, start, end):
     """{symbol: {YYYY-MM-DD: close}}. Options have no reliable history -> empty (marked flat)."""
+    _quiet_yf()
     import yfinance as yf
 
-    out = {}
-    for s in symbols:
-        if OCC_RE.match(s):
-            out[s] = {}
-            continue
+    ordered = list(dict.fromkeys(symbols))
+    exclusive_end = (datetime.strptime(end, "%Y-%m-%d") + timedelta(days=1)).strftime(
+        "%Y-%m-%d"
+    )
+
+    def fetch(symbol):
+        if OCC_RE.match(symbol):
+            return symbol, {}
         try:
-            h = yf.Ticker(s).history(start=start, interval="1d")["Close"]
-            out[s] = {d.strftime("%Y-%m-%d"): float(v) for d, v in h.items()}
+            history = yf.Ticker(symbol).history(
+                start=start,
+                end=exclusive_end,
+                interval="1d",
+                auto_adjust=True,
+                actions=False,
+            )["Close"]
+            return symbol, {
+                stamp.strftime("%Y-%m-%d"): float(value)
+                for stamp, value in history.items()
+            }
         except Exception:
-            out[s] = {}
-    return out
+            return symbol, {}
+
+    if len(ordered) < 2:
+        return dict(fetch(symbol) for symbol in ordered)
+    with ThreadPoolExecutor(max_workers=min(8, len(ordered))) as executor:
+        return dict(executor.map(fetch, ordered))
+
+
+def batch_prices(symbols, price_fn=None, ignore_errors=False):
+    """Fetch unique live marks concurrently while preserving input order."""
+    ordered = list(dict.fromkeys(symbols))
+    price_fn = price_fn or live_price
+
+    def fetch(symbol):
+        try:
+            return symbol, price_fn(symbol)
+        except SystemExit:
+            if ignore_errors:
+                return symbol, None
+            raise
+
+    if len(ordered) < 2:
+        return dict(fetch(symbol) for symbol in ordered)
+    with ThreadPoolExecutor(max_workers=min(8, len(ordered))) as executor:
+        return dict(executor.map(fetch, ordered))
 
 
 def current_equity(conn, account, price_fn=live_price):
     """Live mark-to-market equity right now, using current prices."""
-    row = conn.execute("SELECT cash FROM accounts WHERE name=?", (account,)).fetchone()
-    if not row:
-        raise SystemExit(f"no account '{account}'")
-    eq = row[0]
-    for sym, qty, avg, mult, ac, margin in conn.execute(
-        "SELECT symbol,qty,avg_cost,mult,asset_class,margin FROM positions WHERE account=?",
+    rows = conn.execute(
+        "SELECT a.cash,p.symbol,p.qty,p.avg_cost,p.mult,p.asset_class,p.margin "
+        "FROM accounts a LEFT JOIN positions p ON p.account=a.name "
+        "WHERE a.name=? ORDER BY p.symbol",
         (account,),
-    ):
-        px = price_fn(sym)
+    ).fetchall()
+    if not rows:
+        raise SystemExit(f"no account '{account}'")
+    cash = rows[0][0]
+    positions = [row[1:] for row in rows if row[1] is not None]
+    marks = batch_prices([position[0] for position in positions], price_fn=price_fn)
+    eq = cash
+    for sym, qty, avg, mult, ac, margin in positions:
+        px = marks[sym]
         eq += (qty * mult * (px - avg) + margin) if ac == "future" else qty * mult * px
     return eq
 
 
-def equity_curve(conn, account, closes_fn=_daily_closes, live=False):
+def equity_curve(
+    conn, account, closes_fn=_daily_closes, live=False, with_cashflows=False
+):
     """Daily mark-to-market equity from portfolio start to today, replayed from the ledger.
     Returns [(date, equity)]. Reuses the exact fill math via _apply.
     live=True appends a final point marked at current prices (so a just-started portfolio
@@ -3351,7 +3395,7 @@ def equity_curve(conn, account, closes_fn=_daily_closes, live=False):
     ).fetchall()
     stamps = [r[0] for r in flows] + [r[0] for r in trades]
     if not stamps:
-        return []
+        return ([], flows) if with_cashflows else []
     start, end = min(stamps)[:10], datetime.now().strftime("%Y-%m-%d")
     closes = closes_fn(sorted({t[1] for t in trades}), start, end)
     events = sorted(
@@ -3403,19 +3447,34 @@ def equity_curve(conn, account, closes_fn=_daily_closes, live=False):
     # guarantee at least 2 points so a fresh portfolio still charts a flat line
     if len(curve) == 1:
         curve = [curve[0], curve[0]]
-    return curve
+    return (curve, flows) if with_cashflows else curve
 
 
-def performance_metrics(curve):
-    """Risk/return stats from a daily equity curve. rf assumed 0; annualized on 252 trading days."""
+def performance_metrics(curve, cashflows=None):
+    """Cashflow-adjusted stats from the calendar-daily equity curve (rf=0)."""
     import numpy as np
     import datetime as _dt
 
     if len(curve) < 2:
         return {}
     eq = np.array([e for _, e in curve], float)
-    rets = np.diff(eq) / np.where(eq[:-1] == 0, np.nan, eq[:-1])
-    rets = rets[np.isfinite(rets)]
+    flow_by_date = {}
+    flow_items = cashflows.items() if hasattr(cashflows, "items") else cashflows or []
+    for timestamp, amount in flow_items:
+        day = str(timestamp)[:10]
+        flow_by_date[day] = flow_by_date.get(day, 0.0) + float(amount)
+    initial_date = curve[0][0][:10]
+    returns = []
+    for index in range(1, len(eq)):
+        previous = eq[index - 1]
+        if not previous:
+            continue
+        day = curve[index][0][:10]
+        external_flow = 0.0 if day == initial_date else flow_by_date.get(day, 0.0)
+        period_return = (eq[index] - external_flow) / previous - 1
+        if np.isfinite(period_return):
+            returns.append(period_return)
+    rets = np.array(returns, dtype=float)
     days = max(
         1,
         (
@@ -3425,22 +3484,38 @@ def performance_metrics(curve):
     sd = float(rets.std(ddof=1)) if len(rets) > 1 else 0.0
     dn = rets[rets < 0]
     dsd = float(dn.std(ddof=1)) if len(dn) > 1 else 0.0
-    peak = np.maximum.accumulate(eq)
+    growth = np.cumprod(1 + rets) if len(rets) else np.array([1.0])
+    total = float(growth[-1] - 1)
+    unitized = np.concatenate(([1.0], growth))
+    peak = np.maximum.accumulate(unitized)
+    annual_factor = np.sqrt(365)
     return {
         "start": curve[0][0],
         "end": curve[-1][0],
         "days": days,
         "start_eq": float(eq[0]),
         "end_eq": float(eq[-1]),
-        "total": float(eq[-1] / eq[0] - 1) if eq[0] else 0.0,
-        "cagr": float((eq[-1] / eq[0]) ** (365 / days) - 1) if eq[0] > 0 else 0.0,
-        "vol": sd * np.sqrt(252),
-        "sharpe": float(rets.mean() / sd * np.sqrt(252)) if sd > 0 else 0.0,
-        "sortino": float(rets.mean() / dsd * np.sqrt(252)) if dsd > 0 else 0.0,
-        "mdd": float((eq / peak - 1).min()),
+        "total": total,
+        "cagr": (float((1 + total) ** (365 / days) - 1) if 1 + total > 0 else -1.0),
+        "vol": sd * annual_factor,
+        "sharpe": float(rets.mean() / sd * annual_factor) if sd > 0 else 0.0,
+        "sortino": float(rets.mean() / dsd * annual_factor) if dsd > 0 else 0.0,
+        "mdd": float((unitized / peak - 1).min()),
         "best": float(rets.max()) if len(rets) else 0.0,
         "worst": float(rets.min()) if len(rets) else 0.0,
     }
+
+
+def account_performance(conn, account, closes_fn=_daily_closes, live=True):
+    """Return an equity curve and time-weighted metrics for one account."""
+    curve, cashflows = equity_curve(
+        conn,
+        account,
+        closes_fn=closes_fn,
+        live=live,
+        with_cashflows=True,
+    )
+    return curve, performance_metrics(curve, cashflows=cashflows)
 
 
 def sparkline(values):
@@ -3455,8 +3530,7 @@ def sparkline(values):
 
 
 def show_perf(conn, account):
-    curve = equity_curve(conn, account, live=True)
-    m = performance_metrics(curve)
+    curve, m = account_performance(conn, account, live=True)
     if not m:
         print(f"{account}: no activity yet")
         return

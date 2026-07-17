@@ -51,6 +51,10 @@ Adjusted daily Yahoo prices are used. Options are clearly reported as skipped
 because reliable point-in-time option-chain history is unavailable; futures
 use continuous series without roll costs.
 
+Current-performance returns are time-weighted, so deposits and withdrawals do
+not masquerade as trading gains or losses. Live marks and historical symbols
+load concurrently, and the graph/backtest pair reuses overlapping history.
+
 Alpaca-style order lifecycle:
 
 ```bash
@@ -113,6 +117,7 @@ The tests are standalone scripts:
 ```bash
 python3 test_papertrade.py
 python3 test_backtesting.py
+python3 test_performance.py
 python3 test_concurrency.py
 python3 test_mcp_server.py
 python3 test_dashboard.py

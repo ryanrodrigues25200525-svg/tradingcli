@@ -11,7 +11,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import papertrade as pt
-import portfolio_backtest as pbt
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("papertrade")
@@ -205,21 +204,25 @@ def summary() -> str:
     """One-line-per-portfolio snapshot for all accounts: cash, equity, unrealized P&L, position count.
     Fast overview for deciding which account to act on."""
     conn = pt.db()
-    names = [n for (n,) in conn.execute("SELECT name FROM accounts")]
+    accounts = conn.execute(
+        "SELECT name,cash,deposits,realized FROM accounts ORDER BY name"
+    ).fetchall()
+    positions = conn.execute(
+        "SELECT account,symbol,qty,avg_cost,mult,asset_class,margin "
+        "FROM positions ORDER BY account,symbol"
+    ).fetchall()
+    conn.close()
+    positions_by_account = {name: [] for name, *_ in accounts}
+    for account, *position in positions:
+        positions_by_account.setdefault(account, []).append(position)
+    marks = pt.batch_prices([position[1] for position in positions], ignore_errors=True)
     out = []
-    for name in names:
-        cash, dep, real = conn.execute(
-            "SELECT cash, deposits, realized FROM accounts WHERE name=?", (name,)
-        ).fetchone()
+    for name, cash, dep, real in accounts:
         eq, unreal, npos = cash, 0.0, 0
-        for sym, qty, avg, mult, ac, margin in conn.execute(
-            "SELECT symbol,qty,avg_cost,mult,asset_class,margin FROM positions WHERE account=?",
-            (name,),
-        ):
+        for sym, qty, avg, mult, ac, margin in positions_by_account.get(name, []):
             npos += 1
-            try:
-                px = pt.live_price(sym)
-            except SystemExit:
+            px = marks.get(sym)
+            if px is None:
                 continue
             u = qty * mult * (px - avg)
             unreal += u
@@ -230,7 +233,6 @@ def summary() -> str:
             f"{name}: equity {eq:,.2f}  cash {cash:,.2f}  unreal {unreal:+,.2f}  "
             f"total {total:+,.2f} ({ret:+.2f}%)  {npos} positions"
         )
-    conn.close()
     return "\n".join(out) or "no accounts"
 
 
@@ -240,10 +242,9 @@ def performance(account: str) -> str:
     Reconstructs a daily equity curve from the trade/cashflow ledger and real historical prices."""
     conn = pt.db()
     try:
-        curve = pt.equity_curve(conn, account, live=True)
+        curve, m = pt.account_performance(conn, account, live=True)
     finally:
         conn.close()
-    m = pt.performance_metrics(curve)
     if not m:
         return f"{account}: no activity yet"
     spark = pt.sparkline([e for _, e in curve])
@@ -271,6 +272,8 @@ def portfolio_backtest(
     the equity curve, return, CAGR, volatility, Sharpe, Sortino, and drawdown.
     This is a current-holdings retrospective, not an out-of-sample strategy test.
     """
+    import portfolio_backtest as pbt
+
     conn = pt.db()
     try:
         result = pbt.run_portfolio_backtest(

@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import contextlib
 import io
+import logging
 import math
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from typing import Callable
 
-import pandas as pd
+logging.getLogger("numexpr").setLevel(logging.WARNING)
+import pandas as pd  # noqa: E402  (silence import-time logging before pandas loads)
 
 
 HistoryFn = Callable[[str, str, str], object]
@@ -71,6 +74,60 @@ def _clean_history(raw, symbol, start, end):
     series = series[series.map(lambda value: math.isfinite(value) and value > 0)]
     series.name = symbol
     return series.astype(float)
+
+
+class YahooHistoryCache:
+    """Request-scoped adjusted-close cache shared by graphs and backtests."""
+
+    def __init__(self, loader=None):
+        self._loader = loader or _default_history
+        self._cache = {}
+        self._lock = threading.Lock()
+
+    def history(self, symbol, start, end):
+        start_date = _iso_date(start, "start")
+        end_date = _iso_date(end, "end")
+        with self._lock:
+            cached = self._cache.get(symbol)
+            if cached and cached[0] <= start_date and cached[1] >= end_date:
+                return cached[2].loc[pd.Timestamp(start) : pd.Timestamp(end)].copy()
+            fetch_start = min(start_date, cached[0]) if cached else start_date
+            fetch_end = max(end_date, cached[1]) if cached else end_date
+
+        raw = self._loader(symbol, fetch_start.isoformat(), fetch_end.isoformat())
+        series = _clean_history(
+            raw, symbol, fetch_start.isoformat(), fetch_end.isoformat()
+        )
+        with self._lock:
+            existing = self._cache.get(symbol)
+            if existing:
+                series = pd.concat([existing[2], series])
+                series = series.loc[~series.index.duplicated(keep="last")].sort_index()
+                fetch_start = min(fetch_start, existing[0])
+                fetch_end = max(fetch_end, existing[1])
+            self._cache[symbol] = (fetch_start, fetch_end, series)
+        return series.loc[pd.Timestamp(start) : pd.Timestamp(end)].copy()
+
+    def daily_closes(self, symbols, start, end, exclude=None):
+        """Return papertrade's date-to-close shape, fetching symbols concurrently."""
+        ordered = list(dict.fromkeys(symbols))
+
+        def fetch(symbol):
+            if exclude and exclude(symbol):
+                return symbol, {}
+            try:
+                series = self.history(symbol, start, end)
+                return symbol, {
+                    stamp.date().isoformat(): float(value)
+                    for stamp, value in series.items()
+                }
+            except Exception:
+                return symbol, {}
+
+        if len(ordered) < 2:
+            return dict(fetch(symbol) for symbol in ordered)
+        with ThreadPoolExecutor(max_workers=min(8, len(ordered))) as executor:
+            return dict(executor.map(fetch, ordered))
 
 
 def _snapshot(conn, account):

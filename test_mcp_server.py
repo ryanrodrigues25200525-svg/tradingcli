@@ -2,12 +2,15 @@
 
 import json
 import os
+import sys
 import tempfile
 
 
 os.environ["PAPERTRADE_DB"] = tempfile.mktemp(suffix=".db")
 
 import mcp_server as mcp
+
+assert "pandas" not in sys.modules  # ordinary MCP tools avoid backtesting startup cost
 
 
 required = {
@@ -137,5 +140,25 @@ health = json.loads(mcp.healthcheck())
 assert health["status"] == "ok" and health["schema_version"] == 3
 clock = json.loads(mcp.market_status())
 assert clock["market"] == "NYSE" and clock["status"] in ("open", "closed")
+
+conn = mcp.pt.db()
+with mcp.pt.writing(conn):
+    conn.execute(
+        "INSERT INTO positions(account,symbol,qty,avg_cost,mult,asset_class,margin) "
+        "VALUES(?,?,?,?,?,?,?)",
+        ("agent", "AAPL", 1, 90, 1, "spot", 0),
+    )
+    conn.execute(
+        "INSERT INTO positions(account,symbol,qty,avg_cost,mult,asset_class,margin) "
+        "VALUES(?,?,?,?,?,?,?)",
+        ("agent", "MSFT", 1, 190, 1, "spot", 0),
+    )
+conn.close()
+original_live_price = mcp.pt.live_price
+mcp.pt.live_price = lambda symbol: {"AAPL": 100, "MSFT": 200}[symbol]
+try:
+    assert "2 positions" in mcp.summary()
+finally:
+    mcp.pt.live_price = original_live_price
 
 print(f"MCP checks passed ({len(names)} tools)")

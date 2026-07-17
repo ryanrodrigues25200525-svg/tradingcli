@@ -17,7 +17,6 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import papertrade as pt
-import portfolio_backtest as pbt
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
@@ -481,9 +480,9 @@ def _chart_group(values, color, width=36, height=9):
     )
 
 
-def backtesting_graphs_view(account, current_curve, backtest):
+def backtesting_graphs_view(account, current_curve, backtest, current_metrics=None):
     """Build the side-by-side current performance and backtest display."""
-    current = pt.performance_metrics(current_curve)
+    current = current_metrics or pt.performance_metrics(current_curve)
     current_values = [equity for _, equity in current_curve]
     current_color = (
         "green"
@@ -635,10 +634,21 @@ def prompt_backtesting_graphs(console, account_filter):
     console.print(
         "  [dim]reconstructing current performance and backtesting this portfolio's open positions…[/dim]"
     )
+    import portfolio_backtest as pbt
+
+    history_cache = pbt.YahooHistoryCache()
+
+    def cached_closes(symbols, start, end):
+        return history_cache.daily_closes(symbols, start, end, exclude=pt.OCC_RE.match)
+
     conn = pt.db()
     try:
-        curve = pt.equity_curve(conn, account, live=True)
-        backtest = pbt.run_portfolio_backtest(conn, account)
+        curve, current_metrics = pt.account_performance(
+            conn, account, closes_fn=cached_closes, live=True
+        )
+        backtest = pbt.run_portfolio_backtest(
+            conn, account, history_fn=history_cache.history
+        )
     except SystemExit as exc:
         console.print(f"  [{RED}]{exc}[/{RED}]")
         time.sleep(1.5)
@@ -646,7 +656,11 @@ def prompt_backtesting_graphs(console, account_filter):
     finally:
         conn.close()
     console.clear()
-    console.print(backtesting_graphs_view(account, curve, backtest))
+    console.print(
+        backtesting_graphs_view(
+            account, curve, backtest, current_metrics=current_metrics
+        )
+    )
     console.input("\n[dim]press Enter to return[/dim]")
 
 

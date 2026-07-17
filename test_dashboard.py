@@ -1,6 +1,7 @@
 """Non-interactive first-run dashboard smoke check."""
 
 import os
+import sys
 import tempfile
 
 
@@ -8,6 +9,8 @@ os.environ["PAPERTRADE_DB"] = tempfile.mktemp(suffix=".db")
 
 import dashboard
 from rich.console import Console
+
+assert "pandas" not in sys.modules  # backtesting stays lazy during normal dashboard use
 
 
 class FakeConsole:
