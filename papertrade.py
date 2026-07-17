@@ -3532,6 +3532,7 @@ CLI_COMMAND_TREE = {
         "forex",
     ],
     "operations": [
+        "backtest",
         "calendar",
         "market",
         "activity",
@@ -3729,6 +3730,14 @@ def _build_parser():
     sub.add_parser("tick")
     for command in ("positions", "orders", "pnl", "perf"):
         sub.add_parser(command).add_argument("-a", "--account")
+    backtest = sub.add_parser(
+        "backtest", help="backtest the selected portfolio's current open positions"
+    )
+    backtest.add_argument("-a", "--account")
+    backtest.add_argument("--start", help="inclusive YYYY-MM-DD")
+    backtest.add_argument("--end", help="inclusive YYYY-MM-DD")
+    backtest.add_argument("--lookback-days", type=int, default=730)
+    backtest.add_argument("--commission-bps", type=float, default=10.0)
     rename = sub.add_parser("rename")
     rename.add_argument("old")
     rename.add_argument("new")
@@ -3937,6 +3946,18 @@ def _run_cli(args):
             print(json.dumps(result, indent=2))
         elif args.cmd == "use":
             set_default(conn, args.name)
+        elif args.cmd == "backtest":
+            from portfolio_backtest import run_portfolio_backtest
+
+            result = run_portfolio_backtest(
+                conn,
+                resolve_account(conn, args.account),
+                start=args.start,
+                end=args.end,
+                lookback_days=args.lookback_days,
+                commission=args.commission_bps / 10_000,
+            )
+            print(json.dumps(result, indent=2))
         elif args.cmd in ("buy", "sell"):
             place(
                 conn,

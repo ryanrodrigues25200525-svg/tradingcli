@@ -17,6 +17,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import papertrade as pt
+import portfolio_backtest as pbt
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
@@ -223,7 +224,7 @@ def render(data, quotes, default, prev=None):
 
     keys = Text.from_markup(
         f"[dim][bold]b[/bold] Buy  [{RED}]●[/{RED}]  [bold]s[/bold] Sell  [{RED}]●[/{RED}]  "
-        f"[bold]o[/bold] Option  [{RED}]●[/{RED}]  [bold]g[/bold] Graph  [{RED}]●[/{RED}]  "
+        f"[bold]o[/bold] Option  [{RED}]●[/{RED}]  [bold]g[/bold] Backtesting & Graphs  [{RED}]●[/{RED}]  "
         f"[bold]c[/bold] Cancel  [{RED}]●[/{RED}]  [bold]n[/bold] New  [{RED}]●[/{RED}]  "
         f"[bold]e[/bold] Rename  [{RED}]●[/{RED}]  [bold]u[/bold] Switch  "
         f"[{RED}]●[/{RED}]  [bold]t[/bold] Tick  [{RED}]●[/{RED}]  "
@@ -463,7 +464,153 @@ def prompt_rename(console):
     time.sleep(1.0)
 
 
-def prompt_graph(console, account_filter):
+def _display_number(value, pattern=".2f", suffix=""):
+    if value is None:
+        return "—"
+    return f"{value:{pattern}}{suffix}"
+
+
+def _chart_group(values, color, width=36, height=9):
+    if not values:
+        return Group("[dim]No curve available.[/dim]")
+    rows = braille_chart(values, width=width, height=height)
+    return Group(
+        f"[dim]{max(values):,.0f}[/dim]",
+        *[f"[{color}]{row}[/{color}]" for row in rows],
+        f"[dim]{min(values):,.0f}[/dim]",
+    )
+
+
+def backtesting_graphs_view(account, current_curve, backtest):
+    """Build the side-by-side current performance and backtest display."""
+    current = pt.performance_metrics(current_curve)
+    current_values = [equity for _, equity in current_curve]
+    current_color = (
+        "green"
+        if not current_values or current_values[-1] >= current_values[0]
+        else RED
+    )
+    current_stats = Table.grid(expand=True, padding=(0, 1))
+    current_stats.add_column(ratio=1)
+    current_stats.add_column(ratio=1)
+    if current:
+        current_stats.add_row(
+            f"[dim]EQUITY[/dim]\n[bold]{current['start_eq']:,.0f} → {current['end_eq']:,.0f}[/bold]",
+            f"[dim]RETURN[/dim]\n{_pct(current['total'])}",
+        )
+        current_stats.add_row(
+            f"[dim]CAGR[/dim]\n{_pct(current['cagr'])}",
+            f"[dim]MAX DD[/dim]\n[{RED}]{current['mdd'] * 100:.2f}%[/{RED}]",
+        )
+        current_stats.add_row(
+            f"[dim]SHARPE / SORTINO[/dim]\n[bold]{current['sharpe']:.2f} / {current['sortino']:.2f}[/bold]",
+            f"[dim]VOL (ANN.)[/dim]\n[bold]{current['vol'] * 100:.1f}%[/bold]",
+        )
+        current_range = (
+            f"[dim]{current['start']} → {current['end']} ({current['days']}d)[/dim]"
+        )
+    else:
+        current_stats.add_row("[dim]No recorded activity yet.[/dim]", "")
+        current_range = "[dim]Waiting for the first account event.[/dim]"
+    current_panel = Panel(
+        Group(
+            current_range,
+            "",
+            _chart_group(current_values, current_color),
+            "",
+            current_stats,
+        ),
+        title="[bold]CURRENT PERFORMANCE[/bold]",
+        title_align="left",
+        border_style=GREY,
+    )
+
+    status = backtest.get("status")
+    if status == "ok":
+        metrics = backtest["metrics"]
+        backtest_values = [point["equity"] for point in backtest["curve"]]
+        backtest_color = (
+            "green"
+            if not backtest_values or backtest_values[-1] >= backtest_values[0]
+            else RED
+        )
+        backtest_stats = Table.grid(expand=True, padding=(0, 1))
+        backtest_stats.add_column(ratio=1)
+        backtest_stats.add_column(ratio=1)
+        backtest_stats.add_row(
+            "[dim]EQUITY[/dim]\n[bold]"
+            f"{metrics['initial_equity']:,.0f} → {metrics['final_equity']:,.0f}[/bold]",
+            "[dim]RETURN[/dim]\n[bold]"
+            f"{_display_number(metrics['return_pct'], '+.2f', '%')}[/bold]",
+        )
+        backtest_stats.add_row(
+            "[dim]CAGR[/dim]\n[bold]"
+            f"{_display_number(metrics['cagr_pct'], '+.2f', '%')}[/bold]",
+            f"[dim]MAX DD[/dim]\n[{RED}]"
+            f"{_display_number(metrics['max_drawdown_pct'], '.2f', '%')}[/{RED}]",
+        )
+        backtest_stats.add_row(
+            "[dim]SHARPE / SORTINO[/dim]\n[bold]"
+            f"{_display_number(metrics['sharpe'])} / "
+            f"{_display_number(metrics['sortino'])}[/bold]",
+            "[dim]VOL / COSTS[/dim]\n[bold]"
+            f"{_display_number(metrics['annual_volatility_pct'], '.1f', '%')} / "
+            f"{_display_number(metrics['commissions'], ',.2f')}[/bold]",
+        )
+        backtest_body = Group(
+            f"[dim]{backtest['start']} → {backtest['end']} ({backtest['bars']} bars)[/dim]",
+            "",
+            _chart_group(backtest_values, backtest_color),
+            "",
+            backtest_stats,
+        )
+    else:
+        backtest_body = Group(
+            f"[dim]{backtest.get('start', '')} → {backtest.get('end', '')}[/dim]",
+            "",
+            f"[{RED}]{backtest.get('message', 'Backtest unavailable.')}[/{RED}]",
+            "",
+            "[dim]Open positions in this portfolio will automatically become the backtest universe.[/dim]",
+        )
+    backtest_panel = Panel(
+        backtest_body,
+        title="[bold]CURRENT PORTFOLIO BACKTEST[/bold]",
+        title_align="left",
+        border_style=RED,
+    )
+
+    comparison = Table.grid(expand=True, padding=(0, 1))
+    comparison.add_column(ratio=1)
+    comparison.add_column(ratio=1)
+    comparison.add_row(current_panel, backtest_panel)
+
+    symbols = ", ".join(item["symbol"] for item in backtest.get("symbols", []))
+    skipped = ", ".join(
+        f"{item['symbol']} ({item['reason']})" for item in backtest.get("skipped", [])
+    )
+    notes = Table.grid(expand=True)
+    notes.add_column(style="dim", width=12)
+    notes.add_column(ratio=1)
+    notes.add_row("PORTFOLIO", account)
+    notes.add_row("UNIVERSE", symbols or "no eligible open positions")
+    if skipped:
+        notes.add_row("SKIPPED", skipped)
+    notes.add_row("MODEL", backtest.get("hypothesis", ""))
+    notes.add_row(
+        "COSTS",
+        f"{backtest.get('commission_bps', 0):g} bps at synthetic entry and exit",
+    )
+    if backtest.get("warnings"):
+        notes.add_row("CAUTION", " ".join(backtest["warnings"]))
+    return Group(
+        f"[bold {RED}]BACKTESTING & GRAPHS — {account.upper()}[/bold {RED}]",
+        "",
+        comparison,
+        Panel(notes, title="[bold]BACKTEST DEFINITION[/bold]", border_style=GREY),
+    )
+
+
+def prompt_backtesting_graphs(console, account_filter):
     conn = pt.db()
     names = [n for (n,) in conn.execute("SELECT name FROM accounts")]
     default = (
@@ -474,7 +621,7 @@ def prompt_graph(console, account_filter):
     if not names:
         return
     console.print(
-        f"\n[bold {RED}]▚ Performance chart[/bold {RED}]  [dim]{', '.join(names)}[/dim]"
+        f"\n[bold {RED}]▚ Backtesting & Graphs[/bold {RED}]  [dim]{', '.join(names)}[/dim]"
     )
     account = (
         console.input(f"  which [dim]\\[{account_filter or default}][/dim]: ").strip()
@@ -485,48 +632,26 @@ def prompt_graph(console, account_filter):
         console.print(f"  [{RED}]no portfolio '{account}'[/{RED}]")
         time.sleep(1.0)
         return
-    console.print("  [dim]reconstructing equity curve from history…[/dim]")
+    console.print(
+        "  [dim]reconstructing current performance and backtesting this portfolio's open positions…[/dim]"
+    )
     conn = pt.db()
-    curve = pt.equity_curve(conn, account, live=True)
-    conn.close()
-    m = pt.performance_metrics(curve)
-    if not m:
-        console.print(f"  [{RED}]{account} has no activity yet[/{RED}]")
+    try:
+        curve = pt.equity_curve(conn, account, live=True)
+        backtest = pbt.run_portfolio_backtest(conn, account)
+    except SystemExit as exc:
+        console.print(f"  [{RED}]{exc}[/{RED}]")
         time.sleep(1.5)
         return
+    finally:
+        conn.close()
     console.clear()
-    eq = [e for _, e in curve]
-    chart = braille_chart(eq)
-    up = eq[-1] >= eq[0]
-    col = "green" if up else RED
-    console.print(
-        f"[bold {RED}]{account.upper()}[/bold {RED}]  "
-        f"[dim]{m['start']} → {m['end']}  ({m['days']}d)[/dim]\n"
-    )
-    console.print(f"[dim]{max(eq):,.0f}[/dim]")
-    for row in chart:
-        console.print(f"[{col}]{row}[/{col}]")
-    console.print(f"[dim]{min(eq):,.0f}[/dim]\n")
-
-    stats = Table.grid(expand=True, padding=(0, 2))
-    for _ in range(4):
-        stats.add_column()
-    stats.add_row(
-        f"[dim]EQUITY[/dim]\n[bold]{m['start_eq']:,.0f} → {m['end_eq']:,.0f}[/bold]",
-        f"[dim]RETURN[/dim]\n{_pct(m['total'])}",
-        f"[dim]CAGR[/dim]\n{_pct(m['cagr'])}",
-        f"[dim]MAX DD[/dim]\n[{RED}]{m['mdd'] * 100:.2f}%[/{RED}]",
-    )
-    stats.add_row(
-        f"[dim]SHARPE[/dim]\n[bold]{m['sharpe']:.2f}[/bold]",
-        f"[dim]SORTINO[/dim]\n[bold]{m['sortino']:.2f}[/bold]",
-        f"[dim]VOL (ann)[/dim]\n[bold]{m['vol'] * 100:.1f}%[/bold]",
-        f"[dim]BEST / WORST[/dim]\n[green]{m['best'] * 100:+.2f}%[/green] / [{RED}]{m['worst'] * 100:+.2f}%[/{RED}]",
-    )
-    console.print(
-        Panel(stats, border_style=RED, title="[bold]METRICS[/bold]", title_align="left")
-    )
+    console.print(backtesting_graphs_view(account, curve, backtest))
     console.input("\n[dim]press Enter to return[/dim]")
+
+
+# Compatibility for callers that imported the previous dashboard helper.
+prompt_graph = prompt_backtesting_graphs
 
 
 def prompt_cancel(console):
@@ -606,7 +731,7 @@ def run_dashboard(console, args):
                             "s": "sell",
                             "c": "cancel",
                             "o": "option",
-                            "g": "graph",
+                            "g": "backtesting_graphs",
                             "e": "rename",
                         }[key]
                     if key == "t":
@@ -645,8 +770,8 @@ def main():
             prompt_order(console, action)
         elif action == "option":
             prompt_option(console)
-        elif action == "graph":
-            prompt_graph(console, args.account)
+        elif action == "backtesting_graphs":
+            prompt_backtesting_graphs(console, args.account)
         elif action == "rename":
             prompt_rename(console)
         elif action == "cancel":

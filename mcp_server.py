@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import papertrade as pt
+import portfolio_backtest as pbt
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("papertrade")
@@ -253,6 +254,38 @@ def performance(account: str) -> str:
         f"sharpe {m['sharpe']:.2f}  sortino {m['sortino']:.2f}  vol {m['vol'] * 100:.1f}%\n"
         f"maxDD {m['mdd'] * 100:.2f}%  best {m['best'] * 100:+.2f}%  worst {m['worst'] * 100:+.2f}%"
     )
+
+
+@mcp.tool()
+def portfolio_backtest(
+    account: str,
+    start: str | None = None,
+    end: str | None = None,
+    lookback_days: int = 730,
+    commission_bps: float = 10.0,
+) -> str:
+    """Backtest the account's current open positions and cash with backtesting.py.
+
+    The universe is read from this account's SQLite positions, options without
+    reliable continuous history are reported as skipped, and results include
+    the equity curve, return, CAGR, volatility, Sharpe, Sortino, and drawdown.
+    This is a current-holdings retrospective, not an out-of-sample strategy test.
+    """
+    conn = pt.db()
+    try:
+        result = pbt.run_portfolio_backtest(
+            conn,
+            account,
+            start=start,
+            end=end,
+            lookback_days=lookback_days,
+            commission=commission_bps / 10_000,
+        )
+        return json.dumps(result, indent=2)
+    except SystemExit as exc:
+        return f"error: {exc}"
+    finally:
+        conn.close()
 
 
 @mcp.tool()

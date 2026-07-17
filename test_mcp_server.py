@@ -23,6 +23,7 @@ required = {
     "asset_search",
     "validate_symbol",
     "bulk_quotes",
+    "portfolio_backtest",
     "healthcheck",
     "database_backup",
     "trade_history",
@@ -94,6 +95,8 @@ assert json.loads(mcp.risk_get("agent"))["allow_short"] is False
 assert json.loads(mcp.account_details("agent"))["pending_orders"] == 1
 assert mcp.get_default_account() == "agent"
 assert "source=codex" in mcp.orders("agent")
+backtest = json.loads(mcp.portfolio_backtest("agent"))
+assert backtest["status"] == "no_positions" and backtest["account"] == "agent"
 assert "[codex]" in mcp.audit_log("agent")
 assert mcp.export_history("agent").startswith("id,timestamp")
 

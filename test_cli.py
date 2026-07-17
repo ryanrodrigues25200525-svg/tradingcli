@@ -26,11 +26,14 @@ def run(*args, check=True):
 
 schema = json.loads(run("--schema").stdout)
 assert {"order", "position", "option", "watchlist", "data"} <= set(schema)
+assert "backtest" in schema["operations"]
 
 created = json.loads(run("new", "cli", "--cash", "25000", "--json").stdout)
 assert created["ok"] and "created 'cli'" in created["output"][0]
 accounts = json.loads(run("accounts", "--json").stdout)
 assert accounts == [{"name": "cli", "cash": 25000.0, "default": True}]
+backtest = json.loads(run("backtest", "--json").stdout)
+assert backtest["status"] == "no_positions" and backtest["account"] == "cli"
 
 preview = json.loads(
     run(

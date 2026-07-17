@@ -1,3 +1,4 @@
+backtesting>=0.6.5,<1
 exchange-calendars>=4.13,<5
 mcp>=1.27,<2
 numpy>=2,<3
