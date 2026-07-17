@@ -3810,7 +3810,7 @@ def _build_parser():
     backtest.add_argument("-a", "--account")
     backtest.add_argument("--start", help="inclusive YYYY-MM-DD")
     backtest.add_argument("--end", help="inclusive YYYY-MM-DD")
-    backtest.add_argument("--lookback-days", type=int, default=730)
+    backtest.add_argument("--lookback-days", type=int, default=1825)
     backtest.add_argument("--commission-bps", type=float, default=10.0)
     rename = sub.add_parser("rename")
     rename.add_argument("old")

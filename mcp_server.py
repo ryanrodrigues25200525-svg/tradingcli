@@ -264,7 +264,7 @@ def portfolio_backtest(
     account: str,
     start: str | None = None,
     end: str | None = None,
-    lookback_days: int = 730,
+    lookback_days: int = 1825,
     commission_bps: float = 10.0,
 ) -> str:
     """Backtest the account's current open positions and cash with backtesting.py.
@@ -272,7 +272,8 @@ def portfolio_backtest(
     The universe is read from this account's SQLite positions, options without
     reliable continuous history are reported as skipped, and results include
     the equity curve, return, CAGR, volatility, Sharpe, Sortino, and drawdown.
-    This is a current-holdings retrospective, not an out-of-sample strategy test.
+    The default window is five years; request up to 36500 calendar days. This
+    is a current-holdings retrospective, not an out-of-sample strategy test.
     """
     import portfolio_backtest as pbt
 

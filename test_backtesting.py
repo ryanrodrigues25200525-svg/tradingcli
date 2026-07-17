@@ -9,7 +9,7 @@ import pandas as pd
 os.environ["PAPERTRADE_DB"] = tempfile.mktemp(suffix=".db")
 
 import papertrade as pt
-from portfolio_backtest import run_portfolio_backtest
+from portfolio_backtest import parse_lookback_days, run_portfolio_backtest
 
 
 conn = pt.db()
@@ -86,11 +86,31 @@ assert [item[0] for item in requested] == ["AAPL"]  # beta never leaks into alph
 assert result["bars"] == 5 and len(result["curve"]) == 5
 assert abs(result["metrics"]["gross_hold_return_pct"] - 0.4) < 1e-9
 assert 0.39 < result["metrics"]["return_pct"] <= 0.4
+elapsed_days = (dates[-1] - dates[0]).days
+expected_cagr = (
+    (result["metrics"]["final_equity"] / result["metrics"]["initial_equity"])
+    ** (365.2425 / elapsed_days)
+    - 1
+) * 100
+assert abs(result["metrics"]["cagr_pct"] - expected_cagr) < 1e-9
 assert result["metrics"]["max_drawdown_pct"] <= 0
 assert result["metrics"]["trades"] == 1
 assert result["universe_source"].endswith("selected account 'alpha'.")
 assert result["skipped"][0]["symbol"] == "AAPL270115C00100000"
 assert "look-ahead" in result["warnings"][0]
+
+assert parse_lookback_days("") == 1825
+assert parse_lookback_days("6m") == 183
+assert parse_lookback_days("10y") == 3650
+assert parse_lookback_days("max") == 36500
+assert parse_lookback_days("2500d") == 2500
+for invalid_period in ("3 months", "1d", "40000"):
+    try:
+        parse_lookback_days(invalid_period)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError(f"invalid history period accepted: {invalid_period}")
 
 empty = run_portfolio_backtest(conn, "empty", history_fn=fake_history)
 assert empty["status"] == "no_positions" and not empty["curve"]

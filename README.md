@@ -33,7 +33,7 @@ python3 papertrade.py accounts
 python3 papertrade.py buy AAPL 5
 python3 papertrade.py positions
 python3 papertrade.py market
-python3 papertrade.py backtest --lookback-days 730
+python3 papertrade.py backtest --lookback-days 3650
 ```
 
 Press `g` in the dashboard to open **Backtesting & Graphs**. It shows the
@@ -41,7 +41,9 @@ selected portfolio's live performance curve beside a `backtesting.py`
 current-holdings backtest, including return, CAGR, volatility, Sharpe,
 Sortino, costs, and maximum drawdown. The backtest universe is read directly
 from that account's open positions in SQLite; another account's tickers are
-never mixed in.
+never mixed in. Choose `6m`, `1y`, `2y`, `5y`, `10y`, `max`, or an exact
+number of days when opening the view; pressing Enter requests five years.
+Reported CAGR uses the actual elapsed calendar interval.
 
 The backtest asks a specific retrospective question: how today's open
 quantities and current cash would have performed if held unchanged over the

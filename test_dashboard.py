@@ -107,4 +107,62 @@ recording.print(
 screen = recording.export_text()
 assert "AAPL" in screen and "SHARPE / SORTINO" in screen and "8.00%" in screen
 
+
+class GraphConsole:
+    def __init__(self):
+        self.answers = iter(["main", "10y", ""])
+
+    def clear(self):
+        pass
+
+    def print(self, *_args, **_kwargs):
+        pass
+
+    def input(self, *_args, **_kwargs):
+        return next(self.answers)
+
+
+import portfolio_backtest as pbt  # noqa: E402  (verify lazy import before loading it)
+
+captured = {}
+original_performance = dashboard.pt.account_performance
+original_cache = pbt.YahooHistoryCache
+original_backtest = pbt.run_portfolio_backtest
+dashboard.pt.account_performance = lambda *_args, **_kwargs: (
+    [("2026-01-01", 25_000), ("2026-01-02", 25_000)],
+    None,
+)
+pbt.YahooHistoryCache = lambda: type(
+    "HistoryCache",
+    (),
+    {"history": lambda *_args: {}, "daily_closes": lambda *_args, **_kwargs: {}},
+)()
+
+
+def fake_backtest(_conn, account, **kwargs):
+    captured.update(account=account, **kwargs)
+    return {
+        "status": "no_positions",
+        "start": "2016-01-01",
+        "end": "2026-01-01",
+        "message": "No open positions in this portfolio to backtest.",
+        "symbols": [],
+        "skipped": [],
+        "hypothesis": "Current holdings retrospective.",
+        "commission_bps": 10,
+        "warnings": [],
+    }
+
+
+pbt.run_portfolio_backtest = fake_backtest
+try:
+    dashboard.prompt_backtesting_graphs(GraphConsole(), None)
+finally:
+    dashboard.pt.account_performance = original_performance
+    pbt.YahooHistoryCache = original_cache
+    pbt.run_portfolio_backtest = original_backtest
+
+assert captured["account"] == "main"
+assert captured["lookback_days"] == 3650
+
 print("dashboard checks passed")

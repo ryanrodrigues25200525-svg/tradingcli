@@ -23,6 +23,37 @@ import pandas as pd  # noqa: E402  (silence import-time logging before pandas lo
 
 
 HistoryFn = Callable[[str, str, str], object]
+DEFAULT_LOOKBACK_DAYS = 5 * 365
+LOOKBACK_PRESETS = {
+    "6m": 183,
+    "1y": 365,
+    "2y": 2 * 365,
+    "5y": DEFAULT_LOOKBACK_DAYS,
+    "10y": 10 * 365,
+    "max": 36_500,
+    "all": 36_500,
+}
+
+
+def parse_lookback_days(value, default=DEFAULT_LOOKBACK_DAYS):
+    """Parse a dashboard/MCP history period into validated calendar days."""
+    raw = str(value or "").strip().lower()
+    if not raw:
+        days = default
+    elif raw in LOOKBACK_PRESETS:
+        days = LOOKBACK_PRESETS[raw]
+    else:
+        if raw.endswith("d"):
+            raw = raw[:-1].strip()
+        try:
+            days = int(raw)
+        except (TypeError, ValueError):
+            raise SystemExit(
+                "history must be 6m, 1y, 2y, 5y, 10y, max, or a number of days"
+            ) from None
+    if days < 2 or days > 36_500:
+        raise SystemExit("history must be between 2 and 36500 days")
+    return days
 
 
 def _iso_date(value, name):
@@ -195,6 +226,14 @@ def _finite_number(value):
     return number if math.isfinite(number) else None
 
 
+def _calendar_cagr_pct(initial_equity, final_equity, start, end):
+    """Annualize total return using the real elapsed calendar interval."""
+    elapsed_days = (pd.Timestamp(end) - pd.Timestamp(start)).total_seconds() / 86_400
+    if elapsed_days <= 0 or initial_equity <= 0 or final_equity is None:
+        return None
+    return ((final_equity / initial_equity) ** (365.2425 / elapsed_days) - 1) * 100
+
+
 def _run_engine(portfolio_values, commission):
     try:
         import backtesting
@@ -260,7 +299,7 @@ def run_portfolio_backtest(
     *,
     start=None,
     end=None,
-    lookback_days=730,
+    lookback_days=DEFAULT_LOOKBACK_DAYS,
     commission=0.001,
     history_fn: HistoryFn | None = None,
 ):
@@ -407,7 +446,6 @@ def run_portfolio_backtest(
     metric_keys = {
         "return_pct": "Return [%]",
         "annual_return_pct": "Return (Ann.) [%]",
-        "cagr_pct": "CAGR [%]",
         "annual_volatility_pct": "Volatility (Ann.) [%]",
         "sharpe": "Sharpe Ratio",
         "sortino": "Sortino Ratio",
@@ -421,10 +459,20 @@ def run_portfolio_backtest(
         name: _finite_number(stats.get(stat_name))
         for name, stat_name in metric_keys.items()
     }
+    initial_equity = float(portfolio_values.iloc[0])
+    final_equity = _finite_number(stats.get("Equity Final [$]"))
+    # backtesting.py 0.6.5 divides calendar duration by 252 for business-day
+    # data, understating CAGR. Annualize against the real elapsed dates here.
+    metrics["cagr_pct"] = _calendar_cagr_pct(
+        initial_equity,
+        final_equity,
+        prices.index[0],
+        prices.index[-1],
+    )
     metrics.update(
         {
-            "initial_equity": float(portfolio_values.iloc[0]),
-            "final_equity": _finite_number(stats.get("Equity Final [$]")),
+            "initial_equity": initial_equity,
+            "final_equity": final_equity,
             "peak_equity": _finite_number(stats.get("Equity Peak [$]")),
             "positive_days_pct": positive_days,
             "gross_hold_return_pct": float(

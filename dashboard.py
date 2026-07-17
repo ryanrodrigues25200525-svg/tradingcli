@@ -631,10 +631,21 @@ def prompt_backtesting_graphs(console, account_filter):
         console.print(f"  [{RED}]no portfolio '{account}'[/{RED}]")
         time.sleep(1.0)
         return
-    console.print(
-        "  [dim]reconstructing current performance and backtesting this portfolio's open positions…[/dim]"
-    )
     import portfolio_backtest as pbt
+
+    history = console.input(
+        "  history [dim](6m/1y/2y/5y/10y/max or days)[/dim] [5y]: "
+    ).strip()
+    try:
+        lookback_days = pbt.parse_lookback_days(history)
+    except SystemExit as exc:
+        console.print(f"  [{RED}]{exc}[/{RED}]")
+        time.sleep(1.5)
+        return
+    console.print(
+        "  [dim]reconstructing current performance and backtesting this "
+        f"portfolio's open positions over up to {lookback_days:,} days…[/dim]"
+    )
 
     history_cache = pbt.YahooHistoryCache()
 
@@ -647,7 +658,10 @@ def prompt_backtesting_graphs(console, account_filter):
             conn, account, closes_fn=cached_closes, live=True
         )
         backtest = pbt.run_portfolio_backtest(
-            conn, account, history_fn=history_cache.history
+            conn,
+            account,
+            lookback_days=lookback_days,
+            history_fn=history_cache.history,
         )
     except SystemExit as exc:
         console.print(f"  [{RED}]{exc}[/{RED}]")
