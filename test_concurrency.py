@@ -29,6 +29,17 @@ try:
         pt.tick(conn, price_fn=lambda _s: 100.0)
     elif action == "tick_expiry":
         pt.tick(conn, price_fn=lambda _s: 175.0)
+    elif action == "advanced_idem":
+        pt.submit_order(
+            conn, "advanced", "MSFT", "buy", qty=1, order_type="stop-limit",
+            stop_price=110.0, limit_price=111.0, client_order_id="same-advanced",
+            source="claude", request_id="same-advanced",
+        )
+    elif action == "watchlist_idem":
+        pt.create_watchlist(
+            conn, "advanced", "Agents", "AAPL,MSFT",
+            source="hermes", request_id="same-watchlist",
+        )
     else:
         raise RuntimeError(action)
 finally:
@@ -102,6 +113,31 @@ with tempfile.TemporaryDirectory() as tmp:
         ]
         == 2
     )
+
+    # New schema-v3 mutations remain exactly-once across independent MCP processes.
+    pt.create_account(conn, "advanced", 100_000, make_default=False)
+    conn.close()
+    run_many("advanced_idem", 30, env)
+    run_many("watchlist_idem", 30, env)
+    conn = pt.db()
+    assert (
+        conn.execute("SELECT COUNT(*) FROM orders WHERE account='advanced'").fetchone()[
+            0
+        ]
+        == 1
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM watchlists WHERE account='advanced'"
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE account='advanced'"
+        ).fetchone()[0]
+        == 3
+    )  # account creation + order + watchlist
 
     # A crossed limit must fill once even when many tick workers see it pending.
     pt.create_account(conn, "limit", 10_000, make_default=False)

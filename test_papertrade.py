@@ -401,7 +401,7 @@ with tempfile.TemporaryDirectory() as backup_dir:
     assert os.path.exists(pt.backup_database(conn, backup_dir))
 conn.close()
 
-# --- v1 -> v2 migration preserves data and expands safely ---
+# --- v1 -> v3 migration preserves data and expands safely ---
 legacy_path = tempfile.mktemp(suffix=".db")
 legacy = sqlite3.connect(legacy_path)
 legacy.executescript(
@@ -426,11 +426,14 @@ legacy.close()
 os.environ["PAPERTRADE_DB"] = legacy_path
 importlib.reload(pt)
 conn = pt.db()
-assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
 assert (
     conn.execute("SELECT cash FROM accounts WHERE name='legacy'").fetchone()[0] == 1234
 )
 assert {"source", "request_id", "reject_reason"} <= pt._cols(conn, "orders")
+assert {"order_type", "stop_price", "time_in_force", "parent_id"} <= pt._cols(
+    conn, "orders"
+)
 assert conn.execute("SELECT 1 FROM risk_settings WHERE account='legacy'").fetchone()
 conn.close()
 print("all checks passed")

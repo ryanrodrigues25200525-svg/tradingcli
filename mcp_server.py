@@ -130,7 +130,8 @@ def orders(account: str, limit: int = 100, offset: int = 0) -> str:
     limit, offset = max(1, min(limit, 500)), max(0, offset)
     conn = pt.db()
     rows = conn.execute(
-        "SELECT id,ts,side,qty,symbol,limit_price,status,filled_price,source,request_id,"
+        "SELECT id,ts,side,qty,symbol,order_type,limit_price,stop_price,time_in_force,"
+        "status,filled_price,source,request_id,client_order_id,parent_id,order_class,"
         "reject_reason FROM orders WHERE account=? ORDER BY id DESC LIMIT ? OFFSET ?",
         (account, limit, offset),
     ).fetchall()
@@ -142,18 +143,35 @@ def orders(account: str, limit: int = 100, offset: int = 0) -> str:
         side,
         qty,
         symbol,
+        order_type,
         price_limit,
+        stop_price,
+        time_in_force,
         status,
         fp,
         source,
         key,
+        client_id,
+        parent_id,
+        order_class,
         reason,
     ) in rows:
-        px = f"@{fp:.2f}" if fp else (f"lim {price_limit:.2f}" if price_limit else "")
+        px = (
+            f"@{fp:.2f}"
+            if fp is not None
+            else f"lim {price_limit:.2f}"
+            if price_limit is not None
+            else f"stop {stop_price:.2f}"
+            if stop_price is not None
+            else ""
+        )
         meta = f" source={source or 'unknown'}" + (f" key={key}" if key else "")
+        meta += f" client={client_id}" if client_id else ""
+        meta += f" parent={parent_id}" if parent_id else ""
         rejected = f" reason={reason}" if reason else ""
         out.append(
-            f"#{oid} {ts} {side} {qty:g} {symbol} {px} [{status}]{meta}{rejected}"
+            f"#{oid} {ts} {side} {qty:g} {symbol} {order_type}/{time_in_force} "
+            f"{order_class} {px} [{status}]{meta}{rejected}"
         )
     return "\n".join(out) or "no orders"
 
@@ -495,7 +513,8 @@ def account_details(account: str) -> str:
                 "SELECT COUNT(*) FROM positions WHERE account=?", (account,)
             ).fetchone()[0],
             "pending_orders": conn.execute(
-                "SELECT COUNT(*) FROM orders WHERE account=? AND status='pending'",
+                "SELECT COUNT(*) FROM orders WHERE account=?"
+                " AND status IN ('pending','held')",
                 (account,),
             ).fetchone()[0],
             "risk": pt.risk_limits(conn, account),
@@ -666,6 +685,512 @@ def audit_log(account: str | None = None, limit: int = 100, offset: int = 0) -> 
 def sync_corporate_actions(account: str | None = None, agent: str = "mcp") -> str:
     """Apply unseen Yahoo Finance stock/ETF dividends and splits exactly once."""
     return _capture(pt.sync_corporate_actions, account, source=agent)
+
+
+@mcp.tool()
+def order_submit(
+    account: str,
+    symbol: str,
+    side: str,
+    qty: float | None = None,
+    notional: float | None = None,
+    order_type: str = "market",
+    limit_price: float | None = None,
+    stop_price: float | None = None,
+    trail_price: float | None = None,
+    trail_percent: float | None = None,
+    time_in_force: str = "gtc",
+    extended_hours: bool = False,
+    client_order_id: str | None = None,
+    order_class: str = "simple",
+    take_profit: float | None = None,
+    stop_loss: float | None = None,
+    stop_loss_limit: float | None = None,
+    dry_run: bool = False,
+    idempotency_key: str | None = None,
+    agent: str = "mcp",
+) -> str:
+    """Submit market, limit, stop, stop-limit, trailing, bracket, OCO, or OTO orders."""
+    tp = {"limit_price": take_profit} if take_profit is not None else None
+    sl = (
+        {"stop_price": stop_loss, "limit_price": stop_loss_limit}
+        if stop_loss is not None
+        else None
+    )
+    return _capture(
+        pt.submit_order,
+        account,
+        symbol,
+        side,
+        qty,
+        notional,
+        order_type,
+        limit_price,
+        stop_price,
+        trail_price,
+        trail_percent,
+        time_in_force,
+        extended_hours,
+        client_order_id,
+        order_class,
+        tp,
+        sl,
+        dry_run,
+        source=agent,
+        request_id=idempotency_key or client_order_id,
+    )
+
+
+@mcp.tool()
+def order_get(
+    order_id: int | None = None,
+    client_order_id: str | None = None,
+    account: str | None = None,
+) -> str:
+    """Get one order by numeric id or by account plus client order id."""
+    conn = pt.db()
+    try:
+        return json.dumps(
+            pt.get_order(conn, order_id, client_order_id, account), indent=2
+        )
+    except SystemExit as exc:
+        return f"error: {exc}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def order_replace(
+    order_id: int,
+    qty: float | None = None,
+    limit_price: float | None = None,
+    stop_price: float | None = None,
+    trail: float | None = None,
+    time_in_force: str | None = None,
+    client_order_id: str | None = None,
+    idempotency_key: str | None = None,
+    agent: str = "mcp",
+) -> str:
+    """Replace selected fields on a pending order and return the new order id."""
+    return _capture(
+        pt.replace_order,
+        order_id,
+        qty,
+        limit_price,
+        stop_price,
+        trail,
+        time_in_force,
+        client_order_id,
+        source=agent,
+        request_id=idempotency_key,
+    )
+
+
+@mcp.tool()
+def order_cancel_all(
+    account: str | None = None,
+    idempotency_key: str | None = None,
+    agent: str = "mcp",
+) -> str:
+    """Cancel every pending/held order, optionally restricted to one account."""
+    return _capture(
+        pt.cancel_all_orders,
+        account,
+        source=agent,
+        request_id=idempotency_key,
+    )
+
+
+@mcp.tool()
+def position_get(account: str, symbol: str) -> str:
+    """Get one live-marked position with market value and unrealized P&L."""
+    conn = pt.db()
+    try:
+        return json.dumps(pt.get_position(conn, account, symbol), indent=2)
+    except SystemExit as exc:
+        return f"error: {exc}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def position_close(
+    account: str,
+    symbol: str,
+    qty: float | None = None,
+    percent: float | None = None,
+    idempotency_key: str | None = None,
+    agent: str = "mcp",
+) -> str:
+    """Close all or part of one position by quantity or percentage."""
+    return _capture(
+        pt.close_position,
+        account,
+        symbol,
+        qty,
+        percent,
+        source=agent,
+        request_id=idempotency_key,
+    )
+
+
+@mcp.tool()
+def position_close_all(
+    account: str,
+    idempotency_key: str | None = None,
+    agent: str = "mcp",
+) -> str:
+    """Liquidate every open position in an account at current market prices."""
+    return _capture(
+        pt.close_all_positions,
+        account,
+        source=agent,
+        request_id=idempotency_key,
+    )
+
+
+@mcp.tool()
+def option_contract(symbol: str) -> str:
+    """Parse and quote one OCC option contract."""
+    try:
+        return json.dumps(pt.option_contract_details(symbol), indent=2)
+    except SystemExit as exc:
+        return f"error: {exc}"
+
+
+@mcp.tool()
+def option_exercise(
+    account: str,
+    symbol: str,
+    qty: float | None = None,
+    idempotency_key: str | None = None,
+    agent: str = "mcp",
+) -> str:
+    """Exercise a held long option into its underlying shares."""
+    return _capture(
+        pt.exercise_option,
+        account,
+        symbol,
+        qty,
+        source=agent,
+        request_id=idempotency_key,
+    )
+
+
+@mcp.tool()
+def option_do_not_exercise(
+    account: str,
+    symbol: str,
+    idempotency_key: str | None = None,
+    agent: str = "mcp",
+) -> str:
+    """Persist a do-not-exercise instruction for a held long option."""
+    return _capture(
+        pt.do_not_exercise_option,
+        account,
+        symbol,
+        source=agent,
+        request_id=idempotency_key,
+    )
+
+
+@mcp.tool()
+def option_multi_leg(
+    account: str,
+    legs_json: str,
+    limit_price: float | None = None,
+    client_order_id: str | None = None,
+    idempotency_key: str | None = None,
+    agent: str = "mcp",
+) -> str:
+    """Atomically trade two-to-four option legs supplied as a JSON list."""
+    try:
+        legs = json.loads(legs_json)
+    except json.JSONDecodeError as exc:
+        return f"error: invalid legs JSON: {exc}"
+    return _capture(
+        pt.submit_option_multileg,
+        account,
+        legs,
+        limit_price,
+        source=agent,
+        request_id=idempotency_key or client_order_id,
+        client_order_id=client_order_id,
+    )
+
+
+@mcp.tool()
+def watchlist_create(
+    account: str,
+    name: str,
+    symbols: str = "",
+    idempotency_key: str | None = None,
+    agent: str = "mcp",
+) -> str:
+    """Create a persistent named watchlist with comma-separated symbols."""
+    return _capture(
+        pt.create_watchlist,
+        account,
+        name,
+        symbols,
+        source=agent,
+        request_id=idempotency_key,
+    )
+
+
+@mcp.tool()
+def watchlist_list(account: str) -> str:
+    """List an account's persistent watchlists."""
+    conn = pt.db()
+    try:
+        return json.dumps(pt.list_watchlists(conn, account), indent=2)
+    except SystemExit as exc:
+        return f"error: {exc}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def watchlist_get(account: str, watchlist: str) -> str:
+    """Get one named watchlist or numeric watchlist id."""
+    conn = pt.db()
+    try:
+        return json.dumps(pt.get_watchlist(conn, account, watchlist), indent=2)
+    except SystemExit as exc:
+        return f"error: {exc}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def watchlist_add(
+    account: str,
+    watchlist: str,
+    symbol: str,
+    idempotency_key: str | None = None,
+    agent: str = "mcp",
+) -> str:
+    """Add a symbol to a persistent watchlist."""
+    return _capture(
+        pt.add_watchlist_symbol,
+        account,
+        watchlist,
+        symbol,
+        source=agent,
+        request_id=idempotency_key,
+    )
+
+
+@mcp.tool()
+def watchlist_remove(
+    account: str,
+    watchlist: str,
+    symbol: str,
+    idempotency_key: str | None = None,
+    agent: str = "mcp",
+) -> str:
+    """Remove a symbol from a persistent watchlist."""
+    return _capture(
+        pt.remove_watchlist_symbol,
+        account,
+        watchlist,
+        symbol,
+        source=agent,
+        request_id=idempotency_key,
+    )
+
+
+@mcp.tool()
+def watchlist_delete(
+    account: str,
+    watchlist: str,
+    idempotency_key: str | None = None,
+    agent: str = "mcp",
+) -> str:
+    """Delete a persistent watchlist."""
+    return _capture(
+        pt.delete_watchlist,
+        account,
+        watchlist,
+        source=agent,
+        request_id=idempotency_key,
+    )
+
+
+@mcp.tool()
+def watchlist_quotes(account: str, watchlist: str) -> str:
+    """Return live quotes for every symbol saved in a watchlist."""
+    conn = pt.db()
+    try:
+        return json.dumps(pt.watchlist_quotes(conn, account, watchlist), indent=2)
+    except SystemExit as exc:
+        return f"error: {exc}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def trading_calendar(start: str | None = None, end: str | None = None) -> str:
+    """List NYSE sessions, including holidays and early closes."""
+    try:
+        return json.dumps(pt.market_calendar(start, end), indent=2)
+    except SystemExit as exc:
+        return f"error: {exc}"
+
+
+@mcp.tool()
+def account_activity(
+    account: str,
+    activity_type: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    limit: int = 100,
+) -> str:
+    """Unified account fills, orders, transfers, dividends, splits, and option events."""
+    conn = pt.db()
+    try:
+        return json.dumps(
+            pt.account_activities(conn, account, activity_type, start, end, limit),
+            indent=2,
+        )
+    except SystemExit as exc:
+        return f"error: {exc}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def market_bars(
+    symbol: str,
+    start: str | None = None,
+    end: str | None = None,
+    timeframe: str = "1Day",
+    limit: int = 100,
+) -> str:
+    """Historical OHLCV bars from Yahoo Finance."""
+    try:
+        return json.dumps(
+            pt.market_history(symbol, "bars", start, end, timeframe, limit), indent=2
+        )
+    except SystemExit as exc:
+        return f"error: {exc}"
+
+
+@mcp.tool()
+def market_quotes(
+    symbol: str,
+    start: str | None = None,
+    end: str | None = None,
+    timeframe: str = "1Day",
+    limit: int = 100,
+) -> str:
+    """Indicative historical quote series derived from Yahoo aggregates."""
+    try:
+        return json.dumps(
+            pt.market_history(symbol, "quotes", start, end, timeframe, limit),
+            indent=2,
+        )
+    except SystemExit as exc:
+        return f"error: {exc}"
+
+
+@mcp.tool()
+def market_trades(
+    symbol: str,
+    start: str | None = None,
+    end: str | None = None,
+    timeframe: str = "1Day",
+    limit: int = 100,
+) -> str:
+    """Historical aggregate trade series from Yahoo Finance."""
+    try:
+        return json.dumps(
+            pt.market_history(symbol, "trades", start, end, timeframe, limit),
+            indent=2,
+        )
+    except SystemExit as exc:
+        return f"error: {exc}"
+
+
+@mcp.tool()
+def market_latest_quote(symbol: str) -> str:
+    """Latest bid, ask, and last indication."""
+    try:
+        return json.dumps(pt.latest_quote(symbol), indent=2)
+    except SystemExit as exc:
+        return f"error: {exc}"
+
+
+@mcp.tool()
+def market_latest_trade(symbol: str) -> str:
+    """Latest trade indication."""
+    try:
+        return json.dumps(pt.latest_trade(symbol), indent=2)
+    except SystemExit as exc:
+        return f"error: {exc}"
+
+
+@mcp.tool()
+def market_snapshot(symbol: str) -> str:
+    """Combined latest quote, daily bar, previous close, and change."""
+    try:
+        return json.dumps(pt.market_snapshot(symbol), indent=2)
+    except SystemExit as exc:
+        return f"error: {exc}"
+
+
+@mcp.tool()
+def market_news(symbol: str, limit: int = 10) -> str:
+    """Recent symbol news headlines and links."""
+    try:
+        return json.dumps(pt.market_news(symbol, limit), indent=2)
+    except SystemExit as exc:
+        return f"error: {exc}"
+
+
+@mcp.tool()
+def market_most_actives(limit: int = 20) -> str:
+    """Current most-active equity screener."""
+    try:
+        return json.dumps(pt.market_screener("most_actives", limit), indent=2)
+    except SystemExit as exc:
+        return f"error: {exc}"
+
+
+@mcp.tool()
+def market_movers(limit: int = 10) -> str:
+    """Current day gainers and losers."""
+    try:
+        return json.dumps(
+            {
+                "gainers": pt.market_screener("day_gainers", limit),
+                "losers": pt.market_screener("day_losers", limit),
+            },
+            indent=2,
+        )
+    except SystemExit as exc:
+        return f"error: {exc}"
+
+
+@mcp.tool()
+def market_crypto_orderbook(symbol: str) -> str:
+    """Indicative crypto top-of-book; Yahoo does not expose full exchange depth."""
+    try:
+        return json.dumps(pt.crypto_orderbook(symbol), indent=2)
+    except SystemExit as exc:
+        return f"error: {exc}"
+
+
+@mcp.tool()
+def forex_rate(pair: str) -> str:
+    """Latest FX rate for a pair such as USD/EUR."""
+    normalized = pair.upper().replace("/", "")
+    if len(normalized) != 6:
+        return "error: forex pair must look like USD/EUR"
+    try:
+        return json.dumps(pt.latest_quote(f"{normalized}=X"), indent=2)
+    except SystemExit as exc:
+        return f"error: {exc}"
 
 
 if __name__ == "__main__":

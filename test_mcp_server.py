@@ -29,6 +29,37 @@ required = {
     "export_history",
     "sync_corporate_actions",
     "market_status",
+    "order_submit",
+    "order_get",
+    "order_replace",
+    "order_cancel_all",
+    "position_get",
+    "position_close",
+    "position_close_all",
+    "option_contract",
+    "option_exercise",
+    "option_do_not_exercise",
+    "option_multi_leg",
+    "watchlist_create",
+    "watchlist_list",
+    "watchlist_get",
+    "watchlist_add",
+    "watchlist_remove",
+    "watchlist_delete",
+    "watchlist_quotes",
+    "trading_calendar",
+    "account_activity",
+    "market_bars",
+    "market_quotes",
+    "market_trades",
+    "market_latest_quote",
+    "market_latest_trade",
+    "market_snapshot",
+    "market_news",
+    "market_most_actives",
+    "market_movers",
+    "market_crypto_orderbook",
+    "forex_rate",
 }
 names = set(mcp.mcp._tool_manager._tools)
 assert required <= names, required - names
@@ -65,8 +96,42 @@ assert mcp.get_default_account() == "agent"
 assert "source=codex" in mcp.orders("agent")
 assert "[codex]" in mcp.audit_log("agent")
 assert mcp.export_history("agent").startswith("id,timestamp")
+
+advanced = mcp.order_submit(
+    "agent",
+    "MSFT",
+    "buy",
+    qty=1,
+    order_type="stop-limit",
+    limit_price=95,
+    stop_price=100,
+    client_order_id="advanced-1",
+    agent="codex",
+)
+assert "pending" in advanced
+advanced_order = json.loads(
+    mcp.order_get(client_order_id="advanced-1", account="agent")
+)
+assert advanced_order["order_type"] == "stop_limit"
+replacement = mcp.order_replace(
+    advanced_order["id"], limit_price=96, client_order_id="advanced-2"
+)
+assert "replaced" in replacement
+
+assert "created watchlist" in mcp.watchlist_create(
+    "agent", "Tech", "AAPL,MSFT", idempotency_key="watch-1", agent="codex"
+)
+assert json.loads(mcp.watchlist_get("agent", "Tech"))["symbols"] == [
+    "AAPL",
+    "MSFT",
+]
+assert "added" in mcp.watchlist_add("agent", "Tech", "NVDA")
+assert "removed" in mcp.watchlist_remove("agent", "Tech", "NVDA")
+assert json.loads(mcp.account_activity("agent"))
+assert json.loads(mcp.trading_calendar("2026-07-01", "2026-07-06"))
+
 health = json.loads(mcp.healthcheck())
-assert health["status"] == "ok" and health["schema_version"] == 2
+assert health["status"] == "ok" and health["schema_version"] == 3
 clock = json.loads(mcp.market_status())
 assert clock["market"] == "NYSE" and clock["status"] in ("open", "closed")
 

@@ -52,13 +52,16 @@ FUTURES = {
 }
 
 OCC_RE = re.compile(r"^([A-Z]{1,6})(\d{2})(\d{2})(\d{2})([CP])(\d{8})$")
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_RISK = {
     "allow_short": True,
     "allow_naked_options": False,
     "max_gross_leverage": 2.0,
     "max_order_notional": None,
 }
+ORDER_TYPES = {"market", "limit", "stop", "stop_limit", "trailing_stop"}
+TIME_IN_FORCE = {"gtc", "day", "ioc", "fok", "opg", "cls"}
+ORDER_CLASSES = {"simple", "bracket", "oco", "oto", "mleg"}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY, value TEXT);
@@ -70,7 +73,11 @@ CREATE TABLE IF NOT EXISTS positions(account TEXT, symbol TEXT, qty REAL NOT NUL
 CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY AUTOINCREMENT, account TEXT,
   symbol TEXT, side TEXT, qty REAL, limit_price REAL, status TEXT DEFAULT 'pending',
   filled_price REAL, ts TEXT, source TEXT DEFAULT 'unknown', request_id TEXT,
-  reject_reason TEXT);
+  reject_reason TEXT, order_type TEXT DEFAULT 'market', stop_price REAL,
+  trail_price REAL, trail_percent REAL, hwm REAL, time_in_force TEXT DEFAULT 'gtc',
+  extended_hours INTEGER DEFAULT 0, notional REAL, client_order_id TEXT,
+  replaced_by INTEGER, parent_id INTEGER, order_class TEXT DEFAULT 'simple',
+  triggered INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS cashflow(id INTEGER PRIMARY KEY AUTOINCREMENT, account TEXT,
   ts TEXT, amount REAL);
 CREATE TABLE IF NOT EXISTS risk_settings(account TEXT PRIMARY KEY,
@@ -85,6 +92,16 @@ CREATE TABLE IF NOT EXISTS corporate_actions(id INTEGER PRIMARY KEY AUTOINCREMEN
   kind TEXT NOT NULL, value REAL NOT NULL, cash_effect REAL DEFAULT 0,
   UNIQUE(account, symbol, action_date, kind));
 CREATE TABLE IF NOT EXISTS corporate_sync(account TEXT, symbol TEXT, last_date TEXT NOT NULL,
+  PRIMARY KEY(account, symbol));
+CREATE TABLE IF NOT EXISTS watchlists(id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account TEXT NOT NULL, name TEXT NOT NULL, created TEXT NOT NULL,
+  UNIQUE(account, name));
+CREATE TABLE IF NOT EXISTS watchlist_symbols(watchlist_id INTEGER NOT NULL,
+  symbol TEXT NOT NULL, position INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(watchlist_id, symbol));
+CREATE TABLE IF NOT EXISTS option_instructions(account TEXT NOT NULL,
+  symbol TEXT NOT NULL, instruction TEXT NOT NULL, qty REAL, ts TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'unknown', request_id TEXT,
   PRIMARY KEY(account, symbol));
 """
 
@@ -114,6 +131,19 @@ def migrate(conn):
         ("source", "TEXT DEFAULT 'unknown'"),
         ("request_id", "TEXT"),
         ("reject_reason", "TEXT"),
+        ("order_type", "TEXT DEFAULT 'market'"),
+        ("stop_price", "REAL"),
+        ("trail_price", "REAL"),
+        ("trail_percent", "REAL"),
+        ("hwm", "REAL"),
+        ("time_in_force", "TEXT DEFAULT 'gtc'"),
+        ("extended_hours", "INTEGER DEFAULT 0"),
+        ("notional", "REAL"),
+        ("client_order_id", "TEXT"),
+        ("replaced_by", "INTEGER"),
+        ("parent_id", "INTEGER"),
+        ("order_class", "TEXT DEFAULT 'simple'"),
+        ("triggered", "INTEGER DEFAULT 0"),
     ]:
         if col not in _cols(conn, "orders"):
             conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {ddl}")
@@ -125,6 +155,14 @@ def migrate(conn):
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_source_request"
         " ON audit_log(source,request_id) WHERE request_id IS NOT NULL"
     )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_client_id"
+        " ON orders(account,client_order_id) WHERE client_order_id IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_orders_pending ON orders(status,account,id)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_parent ON orders(parent_id)")
     if added:  # reconstruct contributed capital = cash + cost basis of open positions
         for name, cash in conn.execute("SELECT name, cash FROM accounts").fetchall():
             basis = conn.execute(
@@ -703,8 +741,21 @@ def _existing_order(conn, source, request_id, intent, close=False):
             )
         return None
     oid, account, symbol, side, qty, limit, status, filled = row
+    audit = conn.execute(
+        "SELECT action FROM audit_log WHERE source=? AND request_id=?",
+        (source, request_id),
+    ).fetchone()
+    expected_action = "order.close" if close else "order.place"
+    if audit and audit[0] != expected_action:
+        raise SystemExit(
+            f"idempotency key '{request_id}' was already used for another action"
+        )
     if close:
-        matches = account == intent["account"] and symbol == intent["symbol"]
+        matches = (
+            account == intent["account"]
+            and symbol == intent["symbol"]
+            and ("qty" not in intent or math.isclose(qty, intent["qty"]))
+        )
     else:
         matches = (
             account == intent["account"]
@@ -763,10 +814,26 @@ def _insert_order_locked(
     source,
     request_id,
     reject_reason=None,
+    order_type=None,
+    stop_price=None,
+    trail_price=None,
+    trail_percent=None,
+    hwm=None,
+    time_in_force="gtc",
+    extended_hours=False,
+    notional=None,
+    client_order_id=None,
+    replaced_by=None,
+    parent_id=None,
+    order_class="simple",
+    triggered=False,
 ):
+    order_type = order_type or ("limit" if limit is not None else "market")
     cur = conn.execute(
         "INSERT INTO orders(account,symbol,side,qty,limit_price,status,filled_price,ts,"
-        "source,request_id,reject_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        "source,request_id,reject_reason,order_type,stop_price,trail_price,trail_percent,"
+        "hwm,time_in_force,extended_hours,notional,client_order_id,replaced_by,parent_id,"
+        "order_class,triggered) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             account,
             symbol,
@@ -779,6 +846,19 @@ def _insert_order_locked(
             source,
             request_id,
             reject_reason,
+            order_type,
+            stop_price,
+            trail_price,
+            trail_percent,
+            hwm,
+            time_in_force,
+            int(bool(extended_hours)),
+            notional,
+            client_order_id,
+            replaced_by,
+            parent_id,
+            order_class,
+            int(bool(triggered)),
         ),
     )
     return cur.lastrowid
@@ -859,6 +939,7 @@ def place(
                 "SELECT 1 FROM accounts WHERE name=?", (account,)
             ).fetchone():
                 raise SystemExit(f"no account '{account}' — create it first")
+            _require_available_cash_locked(conn, account, symbol, side, qty, limit)
             preview = _preview_locked(conn, account, symbol, side, qty, limit)
             if not preview["allowed"]:
                 raise SystemExit(f"risk rejected: {preview['reason']}")
@@ -888,6 +969,630 @@ def place(
             "(run 'tick' to check fills)"
         )
     return oid
+
+
+def _positive(value, label):
+    if value is None or not math.isfinite(value) or value <= 0:
+        raise SystemExit(f"{label} must be a positive finite number")
+    return float(value)
+
+
+def _clean_order_type(value):
+    value = (value or "market").strip().lower().replace("-", "_")
+    if value not in ORDER_TYPES:
+        raise SystemExit(f"order type must be one of: {', '.join(sorted(ORDER_TYPES))}")
+    return value
+
+
+def _order_dict(row):
+    if not row:
+        return None
+    keys = (
+        "id account symbol side qty limit_price status filled_price ts source request_id "
+        "reject_reason order_type stop_price trail_price trail_percent hwm time_in_force "
+        "extended_hours notional client_order_id replaced_by parent_id order_class triggered"
+    ).split()
+    result = dict(zip(keys, row))
+    result["extended_hours"] = bool(result["extended_hours"])
+    result["triggered"] = bool(result["triggered"])
+    return result
+
+
+def get_order(conn, order_id=None, client_order_id=None, account=None):
+    """Return one order and its directly linked children as JSON-friendly data."""
+    columns = (
+        "id,account,symbol,side,qty,limit_price,status,filled_price,ts,source,request_id,"
+        "reject_reason,order_type,stop_price,trail_price,trail_percent,hwm,time_in_force,"
+        "extended_hours,notional,client_order_id,replaced_by,parent_id,order_class,triggered"
+    )
+    if order_id is not None:
+        row = conn.execute(
+            f"SELECT {columns} FROM orders WHERE id=?", (order_id,)
+        ).fetchone()
+    elif client_order_id:
+        if not account:
+            raise SystemExit("account is required with client order id")
+        row = conn.execute(
+            f"SELECT {columns} FROM orders WHERE account=? AND client_order_id=?",
+            (account, client_order_id),
+        ).fetchone()
+    else:
+        raise SystemExit("order id or client order id required")
+    order = _order_dict(row)
+    if not order:
+        raise SystemExit("order not found")
+    children = conn.execute(
+        f"SELECT {columns} FROM orders WHERE parent_id=? ORDER BY id", (order["id"],)
+    ).fetchall()
+    order["children"] = [_order_dict(child) for child in children]
+    return order
+
+
+def _linked_exit_orders_locked(
+    conn,
+    parent_id,
+    account,
+    symbol,
+    entry_side,
+    qty,
+    take_profit,
+    stop_loss,
+    status,
+    ts,
+    source,
+    order_class,
+):
+    """Create held/active exit legs for bracket and OTO entry orders."""
+    exit_side = "sell" if entry_side == "buy" else "buy"
+    ids = []
+    if take_profit is not None:
+        price = (
+            take_profit.get("limit_price")
+            if isinstance(take_profit, dict)
+            else take_profit
+        )
+        price = _positive(price, "take-profit limit price")
+        ids.append(
+            _insert_order_locked(
+                conn,
+                account,
+                symbol,
+                exit_side,
+                qty,
+                price,
+                status,
+                None,
+                ts,
+                source,
+                None,
+                order_type="limit",
+                parent_id=parent_id,
+                order_class=order_class,
+            )
+        )
+    if stop_loss is not None:
+        if isinstance(stop_loss, dict):
+            stop = stop_loss.get("stop_price")
+            limit = stop_loss.get("limit_price")
+        else:
+            stop, limit = stop_loss, None
+        stop = _positive(stop, "stop-loss stop price")
+        if limit is not None:
+            limit = _positive(limit, "stop-loss limit price")
+        ids.append(
+            _insert_order_locked(
+                conn,
+                account,
+                symbol,
+                exit_side,
+                qty,
+                limit,
+                status,
+                None,
+                ts,
+                source,
+                None,
+                order_type="stop_limit" if limit else "stop",
+                stop_price=stop,
+                parent_id=parent_id,
+                order_class=order_class,
+            )
+        )
+    return ids
+
+
+def _reserved_cash_locked(conn, account, exclude_order_id=None):
+    """Approximate buying power held by active opening orders."""
+    reserved = 0.0
+    for oid, symbol, side, qty, limit, stop, hwm in conn.execute(
+        "SELECT id,symbol,side,qty,limit_price,stop_price,hwm FROM orders"
+        " WHERE account=? AND status='pending'",
+        (account,),
+    ):
+        if oid == exclude_order_id:
+            continue
+        asset_class, multiplier, margin = classify(symbol)
+        if asset_class == "future":
+            reserved += abs(qty) * margin
+        elif side == "buy":
+            reference = limit or stop or hwm or 0.0
+            reserved += qty * multiplier * reference
+    return reserved
+
+
+def _require_available_cash_locked(
+    conn, account, symbol, side, qty, price, exclude_order_id=None
+):
+    asset_class, multiplier, margin = classify(symbol)
+    required = (
+        qty * margin
+        if asset_class == "future"
+        else qty * multiplier * price
+        if side == "buy"
+        else 0.0
+    )
+    if required <= 0:
+        return
+    cash = conn.execute(
+        "SELECT cash FROM accounts WHERE name=?", (account,)
+    ).fetchone()[0]
+    available = cash - _reserved_cash_locked(conn, account, exclude_order_id)
+    if required > available + 1e-9:
+        raise SystemExit(
+            f"insufficient buying power after open orders: need {required:,.2f}, "
+            f"available {available:,.2f}"
+        )
+
+
+def submit_order(
+    conn,
+    account,
+    symbol,
+    side,
+    qty=None,
+    notional=None,
+    order_type="market",
+    limit_price=None,
+    stop_price=None,
+    trail_price=None,
+    trail_percent=None,
+    time_in_force="gtc",
+    extended_hours=False,
+    client_order_id=None,
+    order_class="simple",
+    take_profit=None,
+    stop_loss=None,
+    dry_run=False,
+    price_fn=live_price,
+    source="cli",
+    request_id=None,
+):
+    """Submit an Alpaca-style simulated order with durable lifecycle metadata."""
+    source, request_id = _context(source, request_id)
+    symbol = (symbol or "").strip().upper()
+    side = (side or "").strip().lower()
+    order_type = _clean_order_type(order_type)
+    time_in_force = (time_in_force or "gtc").strip().lower()
+    order_class = (order_class or "simple").strip().lower()
+    client_order_id = (client_order_id or "").strip()[:128] or None
+    if not symbol:
+        raise SystemExit("symbol required")
+    if side not in ("buy", "sell"):
+        raise SystemExit("side must be buy or sell")
+    if time_in_force not in TIME_IN_FORCE:
+        raise SystemExit(
+            f"time in force must be one of: {', '.join(sorted(TIME_IN_FORCE))}"
+        )
+    if order_class not in ORDER_CLASSES - {"mleg"}:
+        raise SystemExit("order class must be simple, bracket, oco, or oto")
+    if (qty is None) == (notional is None):
+        raise SystemExit("provide exactly one of quantity or notional")
+    if qty is not None:
+        qty = _positive(qty, "quantity")
+    if notional is not None:
+        notional = _positive(notional, "notional")
+        if classify(symbol)[0] != "spot":
+            raise SystemExit("notional orders are supported only for spot assets")
+    if limit_price is not None:
+        limit_price = _positive(limit_price, "limit price")
+    if stop_price is not None:
+        stop_price = _positive(stop_price, "stop price")
+    if trail_price is not None:
+        trail_price = _positive(trail_price, "trail price")
+    if trail_percent is not None:
+        trail_percent = _positive(trail_percent, "trail percent")
+    if order_type in ("limit", "stop_limit") and limit_price is None:
+        raise SystemExit(f"{order_type.replace('_', '-')} order requires a limit price")
+    if order_type in ("stop", "stop_limit") and stop_price is None:
+        raise SystemExit(f"{order_type.replace('_', '-')} order requires a stop price")
+    if order_type == "trailing_stop" and (trail_price is None) == (
+        trail_percent is None
+    ):
+        raise SystemExit(
+            "trailing stop requires exactly one of trail price or trail percent"
+        )
+    if order_type != "trailing_stop" and (
+        trail_price is not None or trail_percent is not None
+    ):
+        raise SystemExit("trail values are valid only for trailing-stop orders")
+    if extended_hours and (
+        order_type != "limit" or time_in_force not in ("day", "gtc")
+    ):
+        raise SystemExit("extended hours requires a day or gtc limit order")
+    if time_in_force in ("ioc", "fok") and order_type not in ("market", "limit"):
+        raise SystemExit("ioc/fok is supported only for market and limit orders")
+    if order_class == "bracket" and (take_profit is None or stop_loss is None):
+        raise SystemExit("bracket order requires take-profit and stop-loss")
+    if order_class == "oto" and (take_profit is None) == (stop_loss is None):
+        raise SystemExit("oto order requires exactly one exit leg")
+    if order_class == "oco" and (take_profit is None or stop_loss is None):
+        raise SystemExit("oco order requires take-profit and stop-loss")
+
+    requested_qty = qty
+    intent = {
+        "account": account,
+        "symbol": symbol,
+        "side": side,
+        "qty": requested_qty,
+        "notional": notional,
+        "order_type": order_type,
+        "limit_price": limit_price,
+        "stop_price": stop_price,
+        "trail_price": trail_price,
+        "trail_percent": trail_percent,
+        "time_in_force": time_in_force,
+        "extended_hours": bool(extended_hours),
+        "client_order_id": client_order_id,
+        "order_class": order_class,
+        "take_profit": take_profit,
+        "stop_loss": stop_loss,
+    }
+    if request_id and not dry_run:
+        with writing(conn):
+            if _idempotent_action(
+                conn, "order.submit", account, source, request_id, intent
+            ):
+                row = conn.execute(
+                    "SELECT id FROM orders WHERE source=? AND request_id=?",
+                    (source, request_id),
+                ).fetchone()
+                print(f"idempotent replay: order #{row[0]}")
+                return row[0]
+
+    needs_quote = notional is not None or order_type in ("market", "trailing_stop")
+    needs_quote = needs_quote or time_in_force in ("ioc", "fok")
+    price = price_fn(symbol) if needs_quote else None
+    if price is not None and (not math.isfinite(price) or price <= 0):
+        raise SystemExit(f"no valid price for {symbol}")
+    if notional is not None:
+        qty = notional / (classify(symbol)[1] * price)
+    if classify(symbol)[0] == "option" and not math.isclose(qty, round(qty)):
+        raise SystemExit("option quantity must be a whole number")
+    if order_class == "oco":
+        position = conn.execute(
+            "SELECT qty FROM positions WHERE account=? AND symbol=?", (account, symbol)
+        ).fetchone()
+        if (
+            not position
+            or (side == "sell" and position[0] < qty)
+            or (side == "buy" and position[0] > -qty)
+        ):
+            raise SystemExit("oco exits require a sufficient open position")
+    validation_price = price or limit_price or stop_price
+    if dry_run:
+        report = preview_order(
+            conn, account, symbol, side, qty, validation_price, price_fn=price_fn
+        )
+        report.update(
+            {
+                "dry_run": True,
+                "order_type": order_type,
+                "order_class": order_class,
+                "time_in_force": time_in_force,
+                "extended_hours": bool(extended_hours),
+                "estimated_qty": qty,
+                "requested_notional": notional,
+            }
+        )
+        print(json.dumps(report, indent=2))
+        return report
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with writing(conn):
+        if _idempotent_action(
+            conn, "order.submit", account, source, request_id, intent
+        ):
+            row = conn.execute(
+                "SELECT id FROM orders WHERE source=? AND request_id=?",
+                (source, request_id),
+            ).fetchone()
+            print(f"idempotent replay: order #{row[0]}")
+            return row[0]
+        if not conn.execute(
+            "SELECT 1 FROM accounts WHERE name=?", (account,)
+        ).fetchone():
+            raise SystemExit(f"no account '{account}' — create it first")
+        if (
+            client_order_id
+            and conn.execute(
+                "SELECT 1 FROM orders WHERE account=? AND client_order_id=?",
+                (account, client_order_id),
+            ).fetchone()
+        ):
+            raise SystemExit(f"duplicate client order id '{client_order_id}'")
+
+        if order_class == "oco":
+            position = conn.execute(
+                "SELECT qty FROM positions WHERE account=? AND symbol=?",
+                (account, symbol),
+            ).fetchone()
+            if (
+                not position
+                or (side == "sell" and position[0] < qty)
+                or (side == "buy" and position[0] > -qty)
+            ):
+                raise SystemExit("oco exits require a sufficient open position")
+            tp = (
+                take_profit.get("limit_price")
+                if isinstance(take_profit, dict)
+                else take_profit
+            )
+            tp = _positive(tp, "take-profit limit price")
+            oid = _insert_order_locked(
+                conn,
+                account,
+                symbol,
+                side,
+                qty,
+                tp,
+                "pending",
+                None,
+                ts,
+                source,
+                request_id,
+                order_type="limit",
+                time_in_force=time_in_force,
+                extended_hours=extended_hours,
+                notional=notional,
+                client_order_id=client_order_id,
+                order_class="oco",
+            )
+            _linked_exit_orders_locked(
+                conn,
+                oid,
+                account,
+                symbol,
+                "buy" if side == "sell" else "sell",
+                qty,
+                None,
+                stop_loss,
+                "pending",
+                ts,
+                source,
+                "oco",
+            )
+            _audit_locked(conn, "order.submit", account, source, request_id, intent)
+            print(f"pending OCO #{oid} {side} {qty:g} {symbol}")
+            return oid
+
+        immediate = order_type == "market" and time_in_force not in ("opg", "cls")
+        if order_type == "limit" and time_in_force in ("ioc", "fok"):
+            immediate = price <= limit_price if side == "buy" else price >= limit_price
+        status = "filled" if immediate else "pending"
+        if not immediate and time_in_force in ("ioc", "fok"):
+            status = "canceled"
+        if status == "pending":
+            _require_available_cash_locked(
+                conn, account, symbol, side, qty, validation_price
+            )
+        preview = _preview_locked(conn, account, symbol, side, qty, validation_price)
+        if not preview["allowed"]:
+            raise SystemExit(f"risk rejected: {preview['reason']}")
+        if immediate:
+            _fill_locked(conn, account, symbol, side, qty, price)
+        oid = _insert_order_locked(
+            conn,
+            account,
+            symbol,
+            side,
+            qty,
+            limit_price,
+            status,
+            price if immediate else None,
+            ts,
+            source,
+            request_id,
+            order_type=order_type,
+            stop_price=stop_price,
+            trail_price=trail_price,
+            trail_percent=trail_percent,
+            hwm=price if order_type == "trailing_stop" else None,
+            time_in_force=time_in_force,
+            extended_hours=extended_hours,
+            notional=notional,
+            client_order_id=client_order_id,
+            order_class=order_class,
+        )
+        if order_class in ("bracket", "oto"):
+            _linked_exit_orders_locked(
+                conn,
+                oid,
+                account,
+                symbol,
+                side,
+                qty,
+                take_profit,
+                stop_loss,
+                "pending" if immediate else "held",
+                ts,
+                source,
+                order_class,
+            )
+        _audit_locked(conn, "order.submit", account, source, request_id, intent)
+    if status == "filled":
+        print(f"filled #{oid} {side} {qty:g} {symbol} @ {price:.2f}")
+    elif status == "canceled":
+        print(f"canceled #{oid}: {time_in_force} order was not immediately marketable")
+    else:
+        print(f"pending #{oid} {side} {qty:g} {symbol} [{order_type} {time_in_force}]")
+    return oid
+
+
+def replace_order(
+    conn,
+    order_id,
+    qty=None,
+    limit_price=None,
+    stop_price=None,
+    trail=None,
+    time_in_force=None,
+    client_order_id=None,
+    source="cli",
+    request_id=None,
+):
+    """Replace a pending order by creating a new linked order and retiring the old one."""
+    source, request_id = _context(source, request_id)
+    details = {
+        "order_id": int(order_id),
+        "qty": qty,
+        "limit_price": limit_price,
+        "stop_price": stop_price,
+        "trail": trail,
+        "time_in_force": time_in_force,
+        "client_order_id": client_order_id,
+    }
+    with writing(conn):
+        old = get_order(conn, order_id=order_id)
+        if _idempotent_action(
+            conn, "order.replace", old["account"], source, request_id, details
+        ):
+            row = conn.execute(
+                "SELECT replaced_by FROM orders WHERE id=?", (order_id,)
+            ).fetchone()
+            print(f"idempotent replay: replacement #{row[0]}")
+            return row[0]
+        if old["status"] not in ("pending", "held"):
+            raise SystemExit(f"order #{order_id} is {old['status']}, not replaceable")
+        if old["notional"] is not None:
+            raise SystemExit("notional orders cannot be replaced; cancel and resubmit")
+        new_qty = old["qty"] if qty is None else _positive(qty, "quantity")
+        if classify(old["symbol"])[0] == "option" and not math.isclose(
+            new_qty, round(new_qty)
+        ):
+            raise SystemExit("option quantity must be a whole number")
+        new_limit = (
+            old["limit_price"]
+            if limit_price is None
+            else _positive(limit_price, "limit price")
+        )
+        new_stop = (
+            old["stop_price"]
+            if stop_price is None
+            else _positive(stop_price, "stop price")
+        )
+        new_tif = (
+            old["time_in_force"] if time_in_force is None else time_in_force.lower()
+        )
+        if new_tif not in TIME_IN_FORCE:
+            raise SystemExit("invalid time in force")
+        trail_price, trail_percent = old["trail_price"], old["trail_percent"]
+        if trail is not None:
+            trail = _positive(trail, "trail")
+            if trail_price is not None:
+                trail_price = trail
+            elif trail_percent is not None:
+                trail_percent = trail
+            else:
+                raise SystemExit("trail can replace only a trailing-stop order")
+        if (
+            client_order_id
+            and conn.execute(
+                "SELECT 1 FROM orders WHERE account=? AND client_order_id=?",
+                (old["account"], client_order_id),
+            ).fetchone()
+        ):
+            raise SystemExit(f"duplicate client order id '{client_order_id}'")
+        reference = new_limit or new_stop or old["hwm"]
+        if old["status"] == "pending" and reference is not None:
+            _require_available_cash_locked(
+                conn,
+                old["account"],
+                old["symbol"],
+                old["side"],
+                new_qty,
+                reference,
+                exclude_order_id=order_id,
+            )
+            preview = _preview_locked(
+                conn,
+                old["account"],
+                old["symbol"],
+                old["side"],
+                new_qty,
+                reference,
+            )
+            if not preview["allowed"]:
+                raise SystemExit(f"risk rejected: {preview['reason']}")
+        elif qty is not None and reference is None:
+            raise SystemExit("cannot resize an auction market order without a price")
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        new_id = _insert_order_locked(
+            conn,
+            old["account"],
+            old["symbol"],
+            old["side"],
+            new_qty,
+            new_limit,
+            old["status"],
+            None,
+            ts,
+            source,
+            request_id,
+            order_type=old["order_type"],
+            stop_price=new_stop,
+            trail_price=trail_price,
+            trail_percent=trail_percent,
+            hwm=old["hwm"],
+            time_in_force=new_tif,
+            extended_hours=old["extended_hours"],
+            notional=old["notional"],
+            client_order_id=(client_order_id or "").strip() or None,
+            parent_id=old["parent_id"],
+            order_class=old["order_class"],
+            triggered=old["triggered"],
+        )
+        conn.execute(
+            "UPDATE orders SET status='replaced',replaced_by=? WHERE id=?",
+            (new_id, order_id),
+        )
+        conn.execute(
+            "UPDATE orders SET parent_id=? WHERE parent_id=?", (new_id, order_id)
+        )
+        _audit_locked(
+            conn, "order.replace", old["account"], source, request_id, details
+        )
+    print(f"replaced #{order_id} with #{new_id}")
+    return new_id
+
+
+def cancel_all_orders(conn, account=None, source="cli", request_id=None):
+    source, request_id = _context(source, request_id)
+    details = {"account": account}
+    with writing(conn):
+        if _idempotent_action(
+            conn, "order.cancel_all", account, source, request_id, details
+        ):
+            print("idempotent replay: cancel all")
+            return 0
+        params = (account,) if account else ()
+        where = " AND account=?" if account else ""
+        cur = conn.execute(
+            "UPDATE orders SET status='canceled' WHERE status IN ('pending','held')"
+            + where,
+            params,
+        )
+        _audit_locked(conn, "order.cancel_all", account, source, request_id, details)
+    print(f"canceled {cur.rowcount} orders")
+    return cur.rowcount
 
 
 @lru_cache(maxsize=1)
@@ -948,26 +1653,86 @@ def market_open():
     return market_clock()["is_open"]
 
 
+def market_calendar(start=None, end=None):
+    """Return holiday and early-close-aware NYSE sessions for a bounded date range."""
+    from zoneinfo import ZoneInfo
+
+    today = datetime.now(timezone.utc).date()
+    try:
+        start_date = datetime.strptime(start, "%Y-%m-%d").date() if start else today
+        end_date = (
+            datetime.strptime(end, "%Y-%m-%d").date()
+            if end
+            else start_date + timedelta(days=14)
+        )
+    except ValueError:
+        raise SystemExit("calendar dates must use YYYY-MM-DD") from None
+    if end_date < start_date:
+        raise SystemExit("calendar end must not precede start")
+    if (end_date - start_date).days > 366:
+        raise SystemExit("calendar range cannot exceed 366 days")
+    calendar = _nyse_calendar()
+    eastern = ZoneInfo("America/New_York")
+    sessions = []
+    try:
+        for session in calendar.sessions_in_range(start_date, end_date):
+            opened = calendar.session_open(session).to_pydatetime()
+            closed = calendar.session_close(session).to_pydatetime()
+            sessions.append(
+                {
+                    "date": session.date().isoformat(),
+                    "open": opened.astimezone(eastern).isoformat(timespec="minutes"),
+                    "close": closed.astimezone(eastern).isoformat(timespec="minutes"),
+                    "early_close": closed.astimezone(eastern).hour < 16,
+                }
+            )
+    except Exception as exc:
+        raise SystemExit(f"market calendar unavailable: {exc}") from None
+    return sessions
+
+
 def close_position(
     conn,
     account,
     symbol,
+    qty=None,
+    percent=None,
     price_fn=live_price,
     source="cli",
     request_id=None,
 ):
-    """Flatten a position at market (market order opposite to current quantity)."""
+    """Close all or part of a position at market by quantity or percentage."""
     source, request_id = _context(source, request_id)
     symbol = symbol.upper()
-    intent = {"account": account, "symbol": symbol}
+    existing = _existing_order(
+        conn, source, request_id, {"account": account, "symbol": symbol}, close=True
+    )
+    if existing:
+        _print_replayed_order(existing)
+        return existing["id"]
+    if qty is not None and percent is not None:
+        raise SystemExit("provide quantity or percentage, not both")
+    row = conn.execute(
+        "SELECT qty FROM positions WHERE account=? AND symbol=?", (account, symbol)
+    ).fetchone()
+    if not row:
+        raise SystemExit(f"no open position in {symbol}")
+    open_qty = row[0]
+    if percent is not None:
+        if not math.isfinite(percent) or not 0 < percent <= 100:
+            raise SystemExit("percentage must be greater than 0 and at most 100")
+        close_qty = abs(open_qty) * percent / 100
+    elif qty is not None:
+        close_qty = _positive(qty, "quantity")
+        if close_qty > abs(open_qty) + 1e-9:
+            raise SystemExit(f"cannot close {close_qty:g}; only {abs(open_qty):g} open")
+    else:
+        close_qty = abs(open_qty)
+    intent = {"account": account, "symbol": symbol, "qty": close_qty}
     existing = _existing_order(conn, source, request_id, intent, close=True)
     if existing:
         _print_replayed_order(existing)
         return existing["id"]
-    if not conn.execute(
-        "SELECT 1 FROM positions WHERE account=? AND symbol=?", (account, symbol)
-    ).fetchone():
-        raise SystemExit(f"no open position in {symbol}")
     price = price_fn(symbol)  # network fetch outside the write lock
     if not math.isfinite(price) or price <= 0:
         raise SystemExit(f"no valid price for {symbol}")
@@ -982,15 +1747,17 @@ def close_position(
         ).fetchone()
         if not row:
             raise SystemExit(f"no open position in {symbol}")
-        qty = row[0]
-        side = "sell" if qty > 0 else "buy"
-        _fill_locked(conn, account, symbol, side, abs(qty), price)
+        current_qty = row[0]
+        if close_qty > abs(current_qty) + 1e-9:
+            raise SystemExit("position changed while close order was being prepared")
+        side = "sell" if current_qty > 0 else "buy"
+        _fill_locked(conn, account, symbol, side, close_qty, price)
         oid = _insert_order_locked(
             conn,
             account,
             symbol,
             side,
-            abs(qty),
+            close_qty,
             None,
             "filled",
             price,
@@ -1004,10 +1771,343 @@ def close_position(
             account,
             source,
             request_id,
-            {**intent, "order_id": oid, "qty": abs(qty), "filled_price": price},
+            {**intent, "order_id": oid, "filled_price": price},
         )
-    print(f"filled #{oid} {side} {abs(qty):g} {symbol} @ {price:.2f}")
+    print(f"filled #{oid} {side} {close_qty:g} {symbol} @ {price:.2f}")
     return oid
+
+
+def close_all_positions(
+    conn, account, price_fn=live_price, source="cli", request_id=None
+):
+    """Close every currently open position; each leg remains independently auditable."""
+    symbols = [
+        symbol
+        for (symbol,) in conn.execute(
+            "SELECT symbol FROM positions WHERE account=? ORDER BY symbol", (account,)
+        )
+    ]
+    if not symbols:
+        print("no positions")
+        return []
+    ids = []
+    for symbol in symbols:
+        key = f"{request_id}:{symbol}" if request_id else None
+        ids.append(
+            close_position(
+                conn,
+                account,
+                symbol,
+                price_fn=price_fn,
+                source=source,
+                request_id=key,
+            )
+        )
+    print(f"closed {len(ids)} positions")
+    return ids
+
+
+def get_position(conn, account, symbol, price_fn=live_price):
+    symbol = symbol.strip().upper()
+    row = conn.execute(
+        "SELECT qty,avg_cost,mult,asset_class,margin FROM positions"
+        " WHERE account=? AND symbol=?",
+        (account, symbol),
+    ).fetchone()
+    if not row:
+        raise SystemExit(f"no open position in {symbol}")
+    qty, avg, mult, asset_class, margin = row
+    price = price_fn(symbol)
+    unrealized = qty * mult * (price - avg)
+    market_value = (
+        margin + unrealized if asset_class == "future" else qty * mult * price
+    )
+    return {
+        "account": account,
+        "symbol": symbol,
+        "side": "long" if qty > 0 else "short",
+        "qty": abs(qty),
+        "signed_qty": qty,
+        "avg_entry_price": avg,
+        "current_price": price,
+        "market_value": market_value,
+        "unrealized_pl": unrealized,
+        "asset_class": asset_class,
+        "multiplier": mult,
+        "margin": margin,
+    }
+
+
+def list_positions(conn, account, price_fn=live_price):
+    if not conn.execute("SELECT 1 FROM accounts WHERE name=?", (account,)).fetchone():
+        raise SystemExit(f"no account '{account}'")
+    symbols = [
+        symbol
+        for (symbol,) in conn.execute(
+            "SELECT symbol FROM positions WHERE account=? ORDER BY symbol", (account,)
+        )
+    ]
+    return [get_position(conn, account, symbol, price_fn) for symbol in symbols]
+
+
+def option_contract_details(symbol, price_fn=live_price):
+    symbol = symbol.strip().upper()
+    root, expiry, strike, kind = parse_occ(symbol)
+    result = {
+        "symbol": symbol,
+        "underlying": root,
+        "expiration_date": expiry,
+        "strike_price": strike,
+        "type": "call" if kind == "C" else "put",
+        "style": "american",
+        "size": 100,
+        "expired": expiry < datetime.now(timezone.utc).date().isoformat(),
+    }
+    try:
+        result["price"] = price_fn(symbol)
+        result["tradable"] = True
+    except SystemExit as exc:
+        result["price"] = None
+        result["tradable"] = False
+        result["price_error"] = str(exc)
+    return result
+
+
+def exercise_option(conn, account, symbol, qty=None, source="cli", request_id=None):
+    """Exercise a long American option into its underlying shares atomically."""
+    source, request_id = _context(source, request_id)
+    symbol = symbol.strip().upper()
+    root, expiry, strike, kind = parse_occ(symbol)
+    if request_id:
+        prior = conn.execute(
+            "SELECT action,account,details FROM audit_log WHERE source=? AND request_id=?",
+            (source, request_id),
+        ).fetchone()
+        if prior:
+            saved = json.loads(prior[2] or "{}")
+            if (
+                prior[0] == "option.exercise"
+                and prior[1] == account
+                and saved.get("symbol") == symbol
+                and (qty is None or math.isclose(float(saved.get("qty", 0)), qty))
+            ):
+                print(f"idempotent replay: exercised {symbol}")
+                return
+            raise SystemExit(
+                f"idempotency key '{request_id}' was already used for another action"
+            )
+    row = conn.execute(
+        "SELECT qty FROM positions WHERE account=? AND symbol=?", (account, symbol)
+    ).fetchone()
+    if not row or row[0] <= 0:
+        raise SystemExit("a long option position is required for exercise")
+    exercise_qty = row[0] if qty is None else _positive(qty, "quantity")
+    if not math.isclose(exercise_qty, round(exercise_qty)):
+        raise SystemExit("exercise quantity must be a whole number")
+    if exercise_qty > row[0] + 1e-9:
+        raise SystemExit(f"cannot exercise {exercise_qty:g}; only {row[0]:g} held")
+    details = {"symbol": symbol, "qty": exercise_qty}
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with writing(conn):
+        if _idempotent_action(
+            conn, "option.exercise", account, source, request_id, details
+        ):
+            print(f"idempotent replay: exercised {symbol}")
+            return
+        instruction = conn.execute(
+            "SELECT instruction FROM option_instructions WHERE account=? AND symbol=?",
+            (account, symbol),
+        ).fetchone()
+        if instruction and instruction[0] == "do_not_exercise":
+            raise SystemExit("option is marked do-not-exercise")
+        current = conn.execute(
+            "SELECT qty FROM positions WHERE account=? AND symbol=?", (account, symbol)
+        ).fetchone()
+        if not current or current[0] + 1e-9 < exercise_qty:
+            raise SystemExit("option position changed while exercise was prepared")
+        _fill_locked(
+            conn, account, symbol, "sell", exercise_qty, 0.0, enforce_risk=False
+        )
+        underlying_side = "buy" if kind == "C" else "sell"
+        shares = exercise_qty * 100
+        _fill_locked(
+            conn, account, root, underlying_side, shares, strike, enforce_risk=False
+        )
+        option_order = _insert_order_locked(
+            conn,
+            account,
+            symbol,
+            "sell",
+            exercise_qty,
+            None,
+            "exercised",
+            0.0,
+            ts,
+            source,
+            request_id,
+            order_type="market",
+            order_class="simple",
+        )
+        _insert_order_locked(
+            conn,
+            account,
+            root,
+            underlying_side,
+            shares,
+            None,
+            "exercised",
+            strike,
+            ts,
+            source,
+            None,
+            order_type="market",
+            parent_id=option_order,
+            order_class="simple",
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO option_instructions"
+            "(account,symbol,instruction,qty,ts,source,request_id) VALUES(?,?,?,?,?,?,?)",
+            (account, symbol, "exercise", exercise_qty, ts, source, request_id),
+        )
+        _audit_locked(conn, "option.exercise", account, source, request_id, details)
+    print(
+        f"exercised {exercise_qty:g} {symbol}: {underlying_side} "
+        f"{shares:g} {root} @ {strike:.2f}"
+    )
+
+
+def do_not_exercise_option(conn, account, symbol, source="cli", request_id=None):
+    source, request_id = _context(source, request_id)
+    symbol = symbol.strip().upper()
+    parse_occ(symbol)
+    details = {"symbol": symbol}
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with writing(conn):
+        if _idempotent_action(
+            conn, "option.do_not_exercise", account, source, request_id, details
+        ):
+            print(f"idempotent replay: do-not-exercise {symbol}")
+            return
+        row = conn.execute(
+            "SELECT qty FROM positions WHERE account=? AND symbol=?", (account, symbol)
+        ).fetchone()
+        if not row or row[0] <= 0:
+            raise SystemExit("a long option position is required")
+        existing = conn.execute(
+            "SELECT instruction FROM option_instructions WHERE account=? AND symbol=?",
+            (account, symbol),
+        ).fetchone()
+        if existing and existing[0] == "exercise":
+            raise SystemExit("option has already been exercised")
+        conn.execute(
+            "INSERT OR REPLACE INTO option_instructions"
+            "(account,symbol,instruction,qty,ts,source,request_id) VALUES(?,?,?,?,?,?,?)",
+            (account, symbol, "do_not_exercise", row[0], ts, source, request_id),
+        )
+        _audit_locked(
+            conn, "option.do_not_exercise", account, source, request_id, details
+        )
+    print(f"marked {symbol} do-not-exercise")
+
+
+def submit_option_multileg(
+    conn,
+    account,
+    legs,
+    limit_price=None,
+    price_fn=live_price,
+    source="cli",
+    request_id=None,
+    client_order_id=None,
+):
+    """Atomically fill a two-to-four-leg option strategy at current mid prices."""
+    source, request_id = _context(source, request_id)
+    if not isinstance(legs, list) or not 2 <= len(legs) <= 4:
+        raise SystemExit("multi-leg order requires two to four legs")
+    clean = []
+    for leg in legs:
+        if not isinstance(leg, dict):
+            raise SystemExit("each leg must be an object")
+        symbol = str(leg.get("symbol", "")).upper()
+        parse_occ(symbol)
+        side = str(leg.get("side", "")).lower()
+        if side not in ("buy", "sell"):
+            raise SystemExit("each leg side must be buy or sell")
+        qty = _positive(float(leg.get("qty", 0)), "leg quantity")
+        if not math.isclose(qty, round(qty)):
+            raise SystemExit("option leg quantity must be a whole number")
+        clean.append({"symbol": symbol, "side": side, "qty": qty})
+    roots = {parse_occ(leg["symbol"])[0] for leg in clean}
+    if len(roots) != 1:
+        raise SystemExit("all option legs must share one underlying")
+    if limit_price is not None:
+        limit_price = _positive(limit_price, "net limit price")
+    details = {
+        "legs": clean,
+        "limit_price": limit_price,
+        "client_order_id": client_order_id,
+    }
+    if request_id:
+        with writing(conn):
+            if _idempotent_action(
+                conn, "option.mleg", account, source, request_id, details
+            ):
+                print("idempotent replay: multi-leg option order")
+                return []
+    prices = {leg["symbol"]: price_fn(leg["symbol"]) for leg in clean}
+    net = sum(
+        prices[leg["symbol"]] * leg["qty"] * (1 if leg["side"] == "buy" else -1)
+        for leg in clean
+    )
+    if limit_price is not None and net > limit_price + 1e-9:
+        raise SystemExit(
+            f"strategy net debit {net:.2f} exceeds limit {limit_price:.2f}"
+        )
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with writing(conn):
+        if _idempotent_action(
+            conn, "option.mleg", account, source, request_id, details
+        ):
+            print("idempotent replay: multi-leg option order")
+            return []
+        if not conn.execute(
+            "SELECT 1 FROM accounts WHERE name=?", (account,)
+        ).fetchone():
+            raise SystemExit(f"no account '{account}'")
+        ids = []
+        # Credit legs first avoids rejecting a valid net-credit/debit package mid-transaction.
+        ordered = sorted(clean, key=lambda leg: leg["side"] == "buy")
+        for leg in ordered:
+            _fill_locked(
+                conn,
+                account,
+                leg["symbol"],
+                leg["side"],
+                leg["qty"],
+                prices[leg["symbol"]],
+                enforce_risk=False,
+            )
+            oid = _insert_order_locked(
+                conn,
+                account,
+                leg["symbol"],
+                leg["side"],
+                leg["qty"],
+                None,
+                "filled",
+                prices[leg["symbol"]],
+                ts,
+                source,
+                request_id if not ids else None,
+                order_type="market",
+                client_order_id=client_order_id if not ids else None,
+                parent_id=ids[0] if ids else None,
+                order_class="mleg",
+            )
+            ids.append(oid)
+        _audit_locked(conn, "option.mleg", account, source, request_id, details)
+    print(f"filled multi-leg strategy #{ids[0]} ({len(ids)} legs, net {net:+.2f})")
+    return ids
 
 
 def set_default(conn, name, source="cli", request_id=None):
@@ -1044,8 +2144,8 @@ def cancel(conn, oid, source="cli", request_id=None):
         row = conn.execute("SELECT status FROM orders WHERE id=?", (oid,)).fetchone()
         if not row:
             raise SystemExit(f"no order #{oid}")
-        if row[0] != "pending":
-            raise SystemExit(f"order #{oid} is {row[0]}, not pending")
+        if row[0] not in ("pending", "held"):
+            raise SystemExit(f"order #{oid} is {row[0]}, not cancelable")
         conn.execute("UPDATE orders SET status='canceled' WHERE id=?", (oid,))
         _audit_locked(conn, "order.cancel", account, source, request_id, details)
     print(f"canceled #{oid}")
@@ -1152,6 +2252,8 @@ def rename_account(conn, old, new, source="cli", request_id=None):
             ("risk_settings", "account"),
             ("corporate_actions", "account"),
             ("corporate_sync", "account"),
+            ("watchlists", "account"),
+            ("option_instructions", "account"),
         ]:
             conn.execute(f"UPDATE {tbl} SET {col}=? WHERE {col}=?", (new, old))
         conn.execute(
@@ -1179,6 +2281,13 @@ def wipe_account(conn, name, reset_cash=None, source="cli", request_id=None):
         conn.execute("DELETE FROM orders WHERE account=?", (name,))
         conn.execute("DELETE FROM corporate_actions WHERE account=?", (name,))
         conn.execute("DELETE FROM corporate_sync WHERE account=?", (name,))
+        conn.execute("DELETE FROM option_instructions WHERE account=?", (name,))
+        conn.execute(
+            "DELETE FROM watchlist_symbols WHERE watchlist_id IN"
+            " (SELECT id FROM watchlists WHERE account=?)",
+            (name,),
+        )
+        conn.execute("DELETE FROM watchlists WHERE account=?", (name,))
         if reset_cash is None:
             conn.execute("DELETE FROM accounts WHERE name=?", (name,))
             conn.execute("DELETE FROM cashflow WHERE account=?", (name,))
@@ -1225,6 +2334,13 @@ def settle_expired(conn, price_fn=live_price):
             ).fetchone()
             if not current:
                 continue
+            instruction = conn.execute(
+                "SELECT instruction FROM option_instructions"
+                " WHERE account=? AND symbol=?",
+                (account, occ),
+            ).fetchone()
+            if instruction and instruction[0] == "do_not_exercise":
+                intrinsic = 0.0
             qty = current[0]
             side = "sell" if qty > 0 else "buy"
             _fill_locked(
@@ -1253,70 +2369,189 @@ def settle_expired(conn, price_fn=live_price):
         print(f"settled {occ} at intrinsic {intrinsic:.2f}")
 
 
+def _auction_ready(time_in_force, now=None):
+    from zoneinfo import ZoneInfo
+
+    eastern = (now or datetime.now(timezone.utc)).astimezone(
+        ZoneInfo("America/New_York")
+    )
+    minute = eastern.hour * 60 + eastern.minute
+    if time_in_force == "opg":
+        return eastern.weekday() < 5 and 570 <= minute <= 580
+    if time_in_force == "cls":
+        return eastern.weekday() < 5 and 950 <= minute <= 970
+    return True
+
+
+def _pending_order_decision(order, price):
+    """Return (should_fill, updates, description) for one current quote."""
+    side, kind = order["side"], order["order_type"]
+    updates = {}
+    if kind == "market":
+        ready = _auction_ready(order["time_in_force"])
+        return ready, updates, "awaiting auction" if not ready else "market"
+    if kind == "limit":
+        crossed = (
+            price <= order["limit_price"]
+            if side == "buy"
+            else price >= order["limit_price"]
+        )
+        return crossed, updates, f"limit {order['limit_price']:.2f}"
+    if kind in ("stop", "stop_limit"):
+        triggered = order["triggered"] or (
+            price >= order["stop_price"]
+            if side == "buy"
+            else price <= order["stop_price"]
+        )
+        updates["triggered"] = int(triggered)
+        if not triggered:
+            return False, updates, f"stop {order['stop_price']:.2f}"
+        if kind == "stop":
+            return True, updates, f"stop {order['stop_price']:.2f} triggered"
+        crossed = (
+            price <= order["limit_price"]
+            if side == "buy"
+            else price >= order["limit_price"]
+        )
+        return (
+            crossed,
+            updates,
+            f"stop-limit {order['stop_price']:.2f}/{order['limit_price']:.2f}",
+        )
+    old_hwm = order["hwm"] if order["hwm"] is not None else price
+    hwm = min(old_hwm, price) if side == "buy" else max(old_hwm, price)
+    stop = (
+        hwm + order["trail_price"]
+        if side == "buy" and order["trail_price"] is not None
+        else hwm - order["trail_price"]
+        if order["trail_price"] is not None
+        else hwm * (1 + order["trail_percent"] / 100)
+        if side == "buy"
+        else hwm * (1 - order["trail_percent"] / 100)
+    )
+    updates.update({"hwm": hwm, "stop_price": stop})
+    triggered = price >= stop if side == "buy" else price <= stop
+    return triggered, updates, f"trailing stop {stop:.2f}"
+
+
+def _linked_after_fill_locked(conn, order):
+    held = conn.execute(
+        "SELECT COUNT(*) FROM orders WHERE parent_id=? AND status='held'",
+        (order["id"],),
+    ).fetchone()[0]
+    if held:
+        conn.execute(
+            "UPDATE orders SET status='pending' WHERE parent_id=? AND status='held'",
+            (order["id"],),
+        )
+        return
+    if order["parent_id"] is not None or order["order_class"] == "oco":
+        root = order["parent_id"] or order["id"]
+        conn.execute(
+            "UPDATE orders SET status='canceled' WHERE (id=? OR parent_id=?)"
+            " AND id<>? AND status IN ('pending','held')",
+            (root, root, order["id"]),
+        )
+
+
 def tick(conn, price_fn=live_price):
+    """Advance pending limit, stop, trailing, linked, and auction order state."""
     settle_expired(conn, price_fn)
-    pending = conn.execute(
-        "SELECT id,account,symbol,side,qty,limit_price FROM orders"
-        " WHERE status='pending'"
-    ).fetchall()
-    for oid, account, symbol, side, qty, limit in pending:
-        try:
-            price = price_fn(symbol)  # network fetch outside the write lock
-        except SystemExit as exc:
-            print(f"#{oid} {symbol}: {exc}")
-            continue
-        crossed = price <= limit if side == "buy" else price >= limit
-        if crossed:
+    columns = (
+        "id,account,symbol,side,qty,limit_price,status,filled_price,ts,source,request_id,"
+        "reject_reason,order_type,stop_price,trail_price,trail_percent,hwm,time_in_force,"
+        "extended_hours,notional,client_order_id,replaced_by,parent_id,order_class,triggered"
+    )
+    pending = [
+        _order_dict(row)
+        for row in conn.execute(
+            f"SELECT {columns} FROM orders WHERE status='pending' ORDER BY id"
+        ).fetchall()
+    ]
+    for snapshot in pending:
+        oid = snapshot["id"]
+        if (
+            snapshot["time_in_force"] == "day"
+            and snapshot["ts"][:10] < datetime.now(timezone.utc).date().isoformat()
+        ):
             with writing(conn):
-                # A concurrent tick/cancel may have handled it while the price loaded.
-                current = conn.execute(
-                    "SELECT account,symbol,side,qty,limit_price FROM orders"
-                    " WHERE id=? AND status='pending'",
-                    (oid,),
-                ).fetchone()
-                if not current:
-                    continue
-                account, symbol, side, qty, limit = current
-                crossed = price <= limit if side == "buy" else price >= limit
-                if not crossed:
-                    continue
-                try:
-                    _fill_locked(conn, account, symbol, side, qty, price)
-                except SystemExit as exc:
-                    reason = str(exc)
-                    conn.execute(
-                        "UPDATE orders SET status='rejected', reject_reason=?"
-                        " WHERE id=? AND status='pending'",
-                        (reason, oid),
-                    )
-                    _audit_locked(
-                        conn,
-                        "order.reject",
-                        account,
-                        "engine",
-                        details={"order_id": oid, "reason": reason},
-                    )
-                    print(f"rejected #{oid}: {reason}")
-                    continue
                 conn.execute(
-                    "UPDATE orders SET status='filled', filled_price=?"
-                    " WHERE id=? AND status='pending'",
-                    (price, oid),
+                    "UPDATE orders SET status='expired' WHERE id=? AND status='pending'",
+                    (oid,),
+                )
+            print(f"expired #{oid} {snapshot['symbol']}")
+            continue
+        try:
+            price = price_fn(snapshot["symbol"])
+        except SystemExit as exc:
+            print(f"#{oid} {snapshot['symbol']}: {exc}")
+            continue
+        should_fill, updates, description = _pending_order_decision(snapshot, price)
+        with writing(conn):
+            row = conn.execute(
+                f"SELECT {columns} FROM orders WHERE id=? AND status='pending'", (oid,)
+            ).fetchone()
+            if not row:
+                continue
+            current = _order_dict(row)
+            should_fill, updates, description = _pending_order_decision(current, price)
+            if updates:
+                conn.execute(
+                    "UPDATE orders SET hwm=COALESCE(?,hwm),stop_price=COALESCE(?,stop_price),"
+                    "triggered=COALESCE(?,triggered) WHERE id=? AND status='pending'",
+                    (
+                        updates.get("hwm"),
+                        updates.get("stop_price"),
+                        updates.get("triggered"),
+                        oid,
+                    ),
+                )
+            if not should_fill:
+                print(f"#{oid} {current['symbol']}: price {price:.2f}, {description}")
+                continue
+            try:
+                _fill_locked(
+                    conn,
+                    current["account"],
+                    current["symbol"],
+                    current["side"],
+                    current["qty"],
+                    price,
+                )
+            except SystemExit as exc:
+                reason = str(exc)
+                conn.execute(
+                    "UPDATE orders SET status='rejected',reject_reason=? WHERE id=? AND status='pending'",
+                    (reason, oid),
                 )
                 _audit_locked(
                     conn,
-                    "order.fill",
-                    account,
+                    "order.reject",
+                    current["account"],
                     "engine",
-                    details={"order_id": oid, "filled_price": price},
+                    details={"order_id": oid, "reason": reason},
                 )
+                print(f"rejected #{oid}: {reason}")
+                continue
+            conn.execute(
+                "UPDATE orders SET status='filled',filled_price=? WHERE id=? AND status='pending'",
+                (price, oid),
+            )
+            _linked_after_fill_locked(conn, current)
+            _audit_locked(
+                conn,
+                "order.fill",
+                current["account"],
+                "engine",
+                details={"order_id": oid, "filled_price": price},
+            )
+        if should_fill:
             print(
-                f"filled #{oid} {side} {qty:g} {symbol} @ {price:.2f} (limit {limit:.2f})"
+                f"filled #{oid} {snapshot['side']} {snapshot['qty']:g} "
+                f"{snapshot['symbol']} @ {price:.2f} ({description})"
             )
         else:
-            print(
-                f"#{oid} {side} {qty:g} {symbol} limit {limit:.2f}: price {price:.2f}, no fill"
-            )
+            print(f"#{oid} {snapshot['symbol']}: price {price:.2f}, {description}")
     if not pending:
         print("no pending orders")
 
@@ -1343,7 +2578,7 @@ def _position_qty_before(conn, account, symbol, action_date):
     events = []
     for ts, side, qty in conn.execute(
         "SELECT ts,side,qty FROM orders WHERE account=? AND symbol=?"
-        " AND status IN ('filled','settled') AND substr(ts,1,10)<?",
+        " AND status IN ('filled','settled','exercised') AND substr(ts,1,10)<?",
         (account, symbol, action_date),
     ):
         events.append((ts, 1, qty if side == "buy" else -qty))
@@ -1387,7 +2622,7 @@ def sync_corporate_actions(
     for name, symbol in rows:
         first = conn.execute(
             "SELECT MIN(substr(ts,1,10)) FROM orders WHERE account=? AND symbol=?"
-            " AND status IN ('filled','settled')",
+            " AND status IN ('filled','settled','exercised')",
             (name, symbol),
         ).fetchone()[0]
         if not first:
@@ -1506,6 +2741,367 @@ def validate_asset(symbol, price_fn=live_price):
     }
 
 
+def _symbols(value):
+    values = value.split(",") if isinstance(value, str) else value or []
+    result = []
+    for raw in values:
+        symbol = str(raw).strip().upper()
+        if symbol and symbol not in result:
+            result.append(symbol)
+    return result
+
+
+def create_watchlist(conn, account, name, symbols=None, source="cli", request_id=None):
+    source, request_id = _context(source, request_id)
+    name = (name or "").strip()
+    items = _symbols(symbols)
+    if not name:
+        raise SystemExit("watchlist name required")
+    if len(items) > 200:
+        raise SystemExit("watchlist cannot exceed 200 symbols")
+    details = {"name": name, "symbols": items}
+    with writing(conn):
+        if _idempotent_action(
+            conn, "watchlist.create", account, source, request_id, details
+        ):
+            row = conn.execute(
+                "SELECT id FROM watchlists WHERE account=? AND name=?", (account, name)
+            ).fetchone()
+            print(f"idempotent replay: watchlist {name}")
+            return row[0]
+        if not conn.execute(
+            "SELECT 1 FROM accounts WHERE name=?", (account,)
+        ).fetchone():
+            raise SystemExit(f"no account '{account}'")
+        try:
+            cur = conn.execute(
+                "INSERT INTO watchlists(account,name,created) VALUES(?,?,?)",
+                (
+                    account,
+                    name,
+                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                ),
+            )
+        except sqlite3.IntegrityError:
+            raise SystemExit(f"watchlist '{name}' already exists") from None
+        wid = cur.lastrowid
+        conn.executemany(
+            "INSERT INTO watchlist_symbols(watchlist_id,symbol,position) VALUES(?,?,?)",
+            [(wid, symbol, index) for index, symbol in enumerate(items)],
+        )
+        _audit_locked(conn, "watchlist.create", account, source, request_id, details)
+    print(f"created watchlist '{name}' ({len(items)} symbols)")
+    return wid
+
+
+def list_watchlists(conn, account):
+    if not conn.execute("SELECT 1 FROM accounts WHERE name=?", (account,)).fetchone():
+        raise SystemExit(f"no account '{account}'")
+    return [
+        {"id": wid, "name": name, "symbols": count, "created": created}
+        for wid, name, created, count in conn.execute(
+            "SELECT w.id,w.name,w.created,COUNT(s.symbol) FROM watchlists w"
+            " LEFT JOIN watchlist_symbols s ON s.watchlist_id=w.id"
+            " WHERE w.account=? GROUP BY w.id ORDER BY w.name",
+            (account,),
+        )
+    ]
+
+
+def get_watchlist(conn, account, name_or_id):
+    if str(name_or_id).isdigit():
+        row = conn.execute(
+            "SELECT id,name,created FROM watchlists WHERE account=? AND id=?",
+            (account, int(name_or_id)),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT id,name,created FROM watchlists WHERE account=? AND name=?",
+            (account, str(name_or_id)),
+        ).fetchone()
+    if not row:
+        raise SystemExit(f"no watchlist '{name_or_id}'")
+    wid, name, created = row
+    symbols = [
+        symbol
+        for (symbol,) in conn.execute(
+            "SELECT symbol FROM watchlist_symbols WHERE watchlist_id=? ORDER BY position,symbol",
+            (wid,),
+        )
+    ]
+    return {
+        "id": wid,
+        "account": account,
+        "name": name,
+        "created": created,
+        "symbols": symbols,
+    }
+
+
+def add_watchlist_symbol(
+    conn, account, name_or_id, symbol, source="cli", request_id=None
+):
+    source, request_id = _context(source, request_id)
+    symbol = symbol.strip().upper()
+    if not symbol:
+        raise SystemExit("symbol required")
+    details = {"watchlist": str(name_or_id), "symbol": symbol}
+    with writing(conn):
+        watchlist = get_watchlist(conn, account, name_or_id)
+        if _idempotent_action(
+            conn, "watchlist.add", account, source, request_id, details
+        ):
+            print(f"idempotent replay: {symbol} in {watchlist['name']}")
+            return
+        if symbol not in watchlist["symbols"]:
+            position = conn.execute(
+                "SELECT COALESCE(MAX(position),-1)+1 FROM watchlist_symbols WHERE watchlist_id=?",
+                (watchlist["id"],),
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO watchlist_symbols(watchlist_id,symbol,position) VALUES(?,?,?)",
+                (watchlist["id"], symbol, position),
+            )
+        _audit_locked(conn, "watchlist.add", account, source, request_id, details)
+    print(f"added {symbol} to '{watchlist['name']}'")
+
+
+def remove_watchlist_symbol(
+    conn, account, name_or_id, symbol, source="cli", request_id=None
+):
+    source, request_id = _context(source, request_id)
+    symbol = symbol.strip().upper()
+    details = {"watchlist": str(name_or_id), "symbol": symbol}
+    with writing(conn):
+        watchlist = get_watchlist(conn, account, name_or_id)
+        if _idempotent_action(
+            conn, "watchlist.remove", account, source, request_id, details
+        ):
+            print(f"idempotent replay: removed {symbol}")
+            return
+        cur = conn.execute(
+            "DELETE FROM watchlist_symbols WHERE watchlist_id=? AND symbol=?",
+            (watchlist["id"], symbol),
+        )
+        if not cur.rowcount:
+            raise SystemExit(f"{symbol} is not in '{watchlist['name']}'")
+        _audit_locked(conn, "watchlist.remove", account, source, request_id, details)
+    print(f"removed {symbol} from '{watchlist['name']}'")
+
+
+def delete_watchlist(conn, account, name_or_id, source="cli", request_id=None):
+    source, request_id = _context(source, request_id)
+    details = {"watchlist": str(name_or_id)}
+    with writing(conn):
+        if _idempotent_action(
+            conn, "watchlist.delete", account, source, request_id, details
+        ):
+            print(f"idempotent replay: deleted watchlist {name_or_id}")
+            return
+        watchlist = get_watchlist(conn, account, name_or_id)
+        conn.execute(
+            "DELETE FROM watchlist_symbols WHERE watchlist_id=?", (watchlist["id"],)
+        )
+        conn.execute("DELETE FROM watchlists WHERE id=?", (watchlist["id"],))
+        _audit_locked(conn, "watchlist.delete", account, source, request_id, details)
+    print(f"deleted watchlist '{watchlist['name']}'")
+
+
+def watchlist_quotes(conn, account, name_or_id, price_fn=live_price):
+    watchlist = get_watchlist(conn, account, name_or_id)
+    quotes = []
+    for symbol in watchlist["symbols"]:
+        try:
+            quotes.append({"symbol": symbol, "price": price_fn(symbol), "error": None})
+        except SystemExit as exc:
+            quotes.append({"symbol": symbol, "price": None, "error": str(exc)})
+    return {**watchlist, "quotes": quotes}
+
+
+def _number(value):
+    try:
+        value = float(value)
+        return value if math.isfinite(value) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def market_history(
+    symbol, kind="bars", start=None, end=None, timeframe="1Day", limit=100
+):
+    """Yahoo-backed aggregated bars and indicative quote/trade history."""
+    symbol = symbol.strip().upper()
+    kind = kind.lower()
+    if kind not in ("bars", "quotes", "trades"):
+        raise SystemExit("history kind must be bars, quotes, or trades")
+    intervals = {
+        "1min": "1m",
+        "5min": "5m",
+        "15min": "15m",
+        "1hour": "1h",
+        "1day": "1d",
+        "1week": "1wk",
+        "1month": "1mo",
+    }
+    interval = intervals.get(timeframe.lower())
+    if not interval:
+        raise SystemExit(f"unsupported timeframe '{timeframe}'")
+    limit = max(1, min(int(limit), 5000))
+    _quiet_yf()
+    import yfinance as yf
+
+    kwargs = {"interval": interval, "auto_adjust": False}
+    if start:
+        kwargs["start"] = start
+    if end:
+        kwargs["end"] = end
+    if not start and not end:
+        kwargs["period"] = "1mo" if interval in ("1d", "1wk", "1mo") else "5d"
+    try:
+        frame = yf.Ticker(symbol).history(**kwargs).tail(limit)
+    except Exception as exc:
+        raise SystemExit(f"market history failed: {exc}") from None
+    rows = []
+    for stamp, row in frame.iterrows():
+        timestamp = stamp.isoformat()
+        close = _number(row.get("Close"))
+        if kind == "bars":
+            rows.append(
+                {
+                    "timestamp": timestamp,
+                    "open": _number(row.get("Open")),
+                    "high": _number(row.get("High")),
+                    "low": _number(row.get("Low")),
+                    "close": close,
+                    "volume": _number(row.get("Volume")),
+                }
+            )
+        elif kind == "trades":
+            rows.append(
+                {
+                    "timestamp": timestamp,
+                    "price": close,
+                    "size": _number(row.get("Volume")),
+                    "aggregated": True,
+                }
+            )
+        else:
+            rows.append(
+                {"timestamp": timestamp, "bid": close, "ask": close, "indicative": True}
+            )
+    return {"symbol": symbol, "kind": kind, "timeframe": timeframe, "data": rows}
+
+
+def latest_quote(symbol):
+    symbol = symbol.strip().upper()
+    _quiet_yf()
+    import yfinance as yf
+
+    ticker = yf.Ticker(symbol)
+    try:
+        info = ticker.info or {}
+    except Exception:
+        info = {}
+    price = live_price(symbol)
+    bid, ask = _number(info.get("bid")), _number(info.get("ask"))
+    return {
+        "symbol": symbol,
+        "bid": bid or price,
+        "ask": ask or price,
+        "last": price,
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "indicative": bid is None or ask is None,
+    }
+
+
+def latest_trade(symbol):
+    quote = latest_quote(symbol)
+    return {
+        "symbol": quote["symbol"],
+        "price": quote["last"],
+        "timestamp": quote["timestamp"],
+    }
+
+
+def market_snapshot(symbol):
+    history = market_history(symbol, "bars", timeframe="1Day", limit=2)["data"]
+    quote = latest_quote(symbol)
+    previous = history[-2]["close"] if len(history) > 1 else None
+    change = quote["last"] - previous if previous else None
+    return {
+        "symbol": quote["symbol"],
+        "quote": quote,
+        "latest_bar": history[-1] if history else None,
+        "previous_close": previous,
+        "change": change,
+    }
+
+
+def market_news(symbol, limit=10):
+    symbol = symbol.strip().upper()
+    limit = max(1, min(int(limit), 50))
+    _quiet_yf()
+    import yfinance as yf
+
+    try:
+        items = yf.Ticker(symbol).news or []
+    except Exception as exc:
+        raise SystemExit(f"news unavailable: {exc}") from None
+    result = []
+    for item in items[:limit]:
+        content = item.get("content", item)
+        canonical = content.get("canonicalUrl") or {}
+        url = canonical.get("url") if isinstance(canonical, dict) else canonical
+        result.append(
+            {
+                "title": content.get("title"),
+                "publisher": content.get("provider", {}).get("displayName")
+                or content.get("publisher"),
+                "published": content.get("pubDate")
+                or content.get("providerPublishTime"),
+                "url": url or content.get("link"),
+            }
+        )
+    return result
+
+
+def market_screener(name="most_actives", limit=20):
+    name = name.strip().lower().replace("-", "_")
+    if name not in ("most_actives", "day_gainers", "day_losers"):
+        raise SystemExit("screener must be most-actives, movers, gainers, or losers")
+    limit = max(1, min(int(limit), 100))
+    _quiet_yf()
+    import yfinance as yf
+
+    try:
+        data = yf.screen(name, count=limit)
+        quotes = data.get("quotes", []) if isinstance(data, dict) else []
+    except Exception as exc:
+        raise SystemExit(f"screener unavailable: {exc}") from None
+    return [
+        {
+            "symbol": row.get("symbol"),
+            "name": row.get("shortName"),
+            "price": _number(row.get("regularMarketPrice")),
+            "change_percent": _number(row.get("regularMarketChangePercent")),
+            "volume": _number(row.get("regularMarketVolume")),
+        }
+        for row in quotes[:limit]
+    ]
+
+
+def crypto_orderbook(symbol):
+    quote = latest_quote(symbol)
+    return {
+        "symbol": quote["symbol"],
+        "timestamp": quote["timestamp"],
+        "bids": [{"price": quote["bid"], "size": None}],
+        "asks": [{"price": quote["ask"], "size": None}],
+        "indicative": True,
+        "note": "Yahoo Finance exposes top-of-book indications, not exchange depth.",
+    }
+
+
 def trade_history_csv(conn, account, limit=5000):
     if not conn.execute("SELECT 1 FROM accounts WHERE name=?", (account,)).fetchone():
         raise SystemExit(f"no account '{account}'")
@@ -1519,18 +3115,30 @@ def trade_history_csv(conn, account, limit=5000):
             "side",
             "quantity",
             "symbol",
+            "order_type",
             "limit_price",
+            "stop_price",
+            "trail_price",
+            "trail_percent",
+            "time_in_force",
+            "extended_hours",
+            "notional",
             "status",
             "filled_price",
             "source",
             "request_id",
+            "client_order_id",
+            "parent_id",
+            "order_class",
             "reject_reason",
         ]
     )
     writer.writerows(
         conn.execute(
-            "SELECT id,ts,side,qty,symbol,limit_price,status,filled_price,source,"
-            "request_id,reject_reason FROM orders WHERE account=? ORDER BY id LIMIT ?",
+            "SELECT id,ts,side,qty,symbol,order_type,limit_price,stop_price,trail_price,"
+            "trail_percent,time_in_force,extended_hours,notional,status,filled_price,source,"
+            "request_id,client_order_id,parent_id,order_class,reject_reason"
+            " FROM orders WHERE account=? ORDER BY id LIMIT ?",
             (account, limit),
         )
     )
@@ -1551,6 +3159,81 @@ def audit_events(conn, account=None, limit=100, offset=0):
         " ORDER BY id DESC LIMIT ? OFFSET ?",
         (limit, offset),
     ).fetchall()
+
+
+def account_activities(
+    conn, account, activity_type=None, start=None, end=None, limit=100
+):
+    """Unified fills/orders, transfers, dividends, splits, and option events."""
+    if not conn.execute("SELECT 1 FROM accounts WHERE name=?", (account,)).fetchone():
+        raise SystemExit(f"no account '{account}'")
+    allowed = None
+    if activity_type:
+        allowed = {
+            value.strip().lower() for value in activity_type.split(",") if value.strip()
+        }
+    limit = max(1, min(int(limit), 1000))
+    events = []
+    for oid, ts, symbol, side, qty, status, price, kind, order_class in conn.execute(
+        "SELECT id,ts,symbol,side,qty,status,filled_price,order_type,order_class"
+        " FROM orders WHERE account=?",
+        (account,),
+    ):
+        event_type = "fill" if status in ("filled", "settled", "exercised") else "order"
+        events.append(
+            {
+                "timestamp": ts,
+                "type": event_type,
+                "id": oid,
+                "symbol": symbol,
+                "side": side,
+                "qty": qty,
+                "status": status,
+                "price": price,
+                "order_type": kind,
+                "order_class": order_class,
+            }
+        )
+    for cid, ts, amount in conn.execute(
+        "SELECT id,ts,amount FROM cashflow WHERE account=?", (account,)
+    ):
+        events.append(
+            {"timestamp": ts, "type": "transfer", "id": cid, "amount": amount}
+        )
+    for cid, date, symbol, kind, value, cash in conn.execute(
+        "SELECT id,action_date,symbol,kind,value,cash_effect FROM corporate_actions"
+        " WHERE account=?",
+        (account,),
+    ):
+        events.append(
+            {
+                "timestamp": f"{date}T00:00:00+00:00",
+                "type": kind,
+                "id": cid,
+                "symbol": symbol,
+                "value": value,
+                "cash_effect": cash,
+            }
+        )
+    for symbol, instruction, qty, ts in conn.execute(
+        "SELECT symbol,instruction,qty,ts FROM option_instructions WHERE account=?",
+        (account,),
+    ):
+        events.append(
+            {"timestamp": ts, "type": instruction, "symbol": symbol, "qty": qty}
+        )
+    result = []
+    for event in sorted(events, key=lambda item: item["timestamp"], reverse=True):
+        if allowed and event["type"] not in allowed:
+            continue
+        if start and event["timestamp"][:10] < start:
+            continue
+        if end and event["timestamp"][:10] > end:
+            continue
+        result.append(event)
+        if len(result) >= limit:
+            break
+    return result
 
 
 def backup_database(conn, directory=None):
@@ -1579,6 +3262,10 @@ def healthcheck(conn):
         "pending_orders": conn.execute(
             "SELECT COUNT(*) FROM orders WHERE status='pending'"
         ).fetchone()[0],
+        "held_orders": conn.execute(
+            "SELECT COUNT(*) FROM orders WHERE status='held'"
+        ).fetchone()[0],
+        "watchlists": conn.execute("SELECT COUNT(*) FROM watchlists").fetchone()[0],
         "database": DB,
     }
 
@@ -1658,7 +3345,7 @@ def equity_curve(conn, account, closes_fn=_daily_closes, live=False):
     ).fetchall()
     trades = conn.execute(
         "SELECT ts, symbol, side, qty, filled_price FROM orders"
-        " WHERE account=? AND status IN ('filled','settled')"
+        " WHERE account=? AND status IN ('filled','settled','exercised')"
         " AND filled_price IS NOT NULL ORDER BY ts",
         (account,),
     ).fetchall()
@@ -1824,12 +3511,44 @@ def resolve_account(conn, account):
     return row[0]
 
 
-def main(argv=None):
-    if argv is None:
-        argv = sys.argv[1:]
-    if not argv:
-        argv = ["dash"]  # bare `tradingcli` opens the dashboard
-    p = argparse.ArgumentParser(prog="tradingcli")
+CLI_COMMAND_TREE = {
+    "account": ["new", "accounts", "use", "rename", "deposit", "withdraw", "risk"],
+    "order": ["submit", "list", "get", "replace", "cancel", "cancel-all", "preview"],
+    "position": ["list", "get", "close", "close-all"],
+    "option": ["buy", "sell", "get", "exercise", "do-not-exercise", "mleg", "chain"],
+    "watchlist": ["create", "list", "get", "add", "remove", "delete", "quotes"],
+    "data": [
+        "bars",
+        "quotes",
+        "trades",
+        "latest-bar",
+        "latest-quote",
+        "latest-trade",
+        "snapshot",
+        "news",
+        "most-actives",
+        "movers",
+        "crypto-orderbook",
+        "forex",
+    ],
+    "operations": [
+        "calendar",
+        "market",
+        "activity",
+        "audit",
+        "actions",
+        "tick",
+        "doctor",
+        "backup",
+    ],
+}
+
+
+def _build_parser():
+    p = argparse.ArgumentParser(
+        prog="tradingcli",
+        epilog="Global automation flags: --json --csv --quiet --schema --help-all",
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("new", help="create account")
     c.add_argument("name")
@@ -1838,215 +3557,675 @@ def main(argv=None):
     u = sub.add_parser("use", help="set default account")
     u.add_argument("name")
     for side in ("buy", "sell"):
-        s = sub.add_parser(side)
-        s.add_argument("symbol")
-        s.add_argument("qty", type=float)
-        s.add_argument("-a", "--account")
-        s.add_argument("--limit", type=float)
-    o = sub.add_parser("option", help="trade an option")
-    osub = o.add_subparsers(dest="osub", required=True)
-    for oside in ("buy", "sell"):
-        x = osub.add_parser(oside)
-        x.add_argument("underlying")
-        x.add_argument("expiry", help="YYYY-MM-DD")
-        x.add_argument("strike", type=float)
-        x.add_argument("kind", choices=["C", "P", "c", "p"])
-        x.add_argument("qty", type=float)
-        x.add_argument("-a", "--account")
-        x.add_argument("--limit", type=float)
-    ch = sub.add_parser("chain", help="list option expiries/strikes")
-    ch.add_argument("underlying")
-    ch.add_argument("expiry", nargs="?")
+        parser = sub.add_parser(side, help=f"simple market/limit {side}")
+        parser.add_argument("symbol")
+        parser.add_argument("qty", type=float)
+        parser.add_argument("-a", "--account")
+        parser.add_argument("--limit", type=float)
+
+    order = sub.add_parser("order", help="full Alpaca-style order lifecycle")
+    order_sub = order.add_subparsers(dest="order_cmd", required=True)
+    submit = order_sub.add_parser("submit")
+    submit.add_argument("symbol")
+    submit.add_argument("--side", choices=["buy", "sell"], required=True)
+    amount = submit.add_mutually_exclusive_group(required=True)
+    amount.add_argument("--qty", type=float)
+    amount.add_argument("--notional", type=float)
+    submit.add_argument("--type", default="market")
+    submit.add_argument("--limit-price", type=float)
+    submit.add_argument("--stop-price", type=float)
+    submit.add_argument("--trail-price", type=float)
+    submit.add_argument("--trail-percent", type=float)
+    submit.add_argument("--time-in-force", default="gtc", choices=sorted(TIME_IN_FORCE))
+    submit.add_argument("--extended-hours", action="store_true")
+    submit.add_argument(
+        "--order-class", default="simple", choices=["simple", "bracket", "oco", "oto"]
+    )
+    submit.add_argument("--take-profit", type=float)
+    submit.add_argument("--stop-loss", type=float)
+    submit.add_argument("--stop-loss-limit", type=float)
+    submit.add_argument("--client-order-id")
+    submit.add_argument("--idempotency-key")
+    submit.add_argument("--dry-run", action="store_true")
+    submit.add_argument("-a", "--account")
+    get = order_sub.add_parser("get")
+    target = get.add_mutually_exclusive_group(required=True)
+    target.add_argument("--order-id", type=int)
+    target.add_argument("--client-order-id")
+    get.add_argument("-a", "--account")
+    listing = order_sub.add_parser("list")
+    listing.add_argument("-a", "--account")
+    listing.add_argument("--status", default="all")
+    replace = order_sub.add_parser("replace")
+    replace.add_argument("order_id", type=int)
+    replace.add_argument("--qty", type=float)
+    replace.add_argument("--limit-price", type=float)
+    replace.add_argument("--stop-price", type=float)
+    replace.add_argument("--trail", type=float)
+    replace.add_argument("--time-in-force", choices=sorted(TIME_IN_FORCE))
+    replace.add_argument("--client-order-id")
+    replace.add_argument("--idempotency-key")
+    cancel_one = order_sub.add_parser("cancel")
+    cancel_one.add_argument("order_id", type=int)
+    cancel_one.add_argument("--idempotency-key")
+    cancel_all = order_sub.add_parser("cancel-all")
+    cancel_all.add_argument("-a", "--account")
+    cancel_all.add_argument("--idempotency-key")
+
+    position = sub.add_parser("position", help="position lookup and liquidation")
+    position_sub = position.add_subparsers(dest="position_cmd", required=True)
+    position_sub.add_parser("list").add_argument("-a", "--account")
+    close_all_parser = position_sub.add_parser("close-all")
+    close_all_parser.add_argument("-a", "--account")
+    close_all_parser.add_argument("--idempotency-key")
+    for command in ("get", "close"):
+        parser = position_sub.add_parser(command)
+        parser.add_argument("symbol")
+        parser.add_argument("-a", "--account")
+        if command == "close":
+            size = parser.add_mutually_exclusive_group()
+            size.add_argument("--qty", type=float)
+            size.add_argument("--percent", type=float)
+            parser.add_argument("--idempotency-key")
+
+    option = sub.add_parser("option", help="trade and manage options")
+    option_sub = option.add_subparsers(dest="osub", required=True)
+    for side in ("buy", "sell"):
+        parser = option_sub.add_parser(side)
+        parser.add_argument("underlying")
+        parser.add_argument("expiry", help="YYYY-MM-DD")
+        parser.add_argument("strike", type=float)
+        parser.add_argument("kind", choices=["C", "P", "c", "p"])
+        parser.add_argument("qty", type=float)
+        parser.add_argument("-a", "--account")
+        parser.add_argument("--limit", type=float)
+    option_sub.add_parser("get").add_argument("symbol")
+    exercise = option_sub.add_parser("exercise")
+    exercise.add_argument("symbol")
+    exercise.add_argument("--qty", type=float)
+    exercise.add_argument("-a", "--account")
+    exercise.add_argument("--idempotency-key")
+    dne = option_sub.add_parser("do-not-exercise")
+    dne.add_argument("symbol")
+    dne.add_argument("-a", "--account")
+    dne.add_argument("--idempotency-key")
+    mleg = option_sub.add_parser("mleg", help="JSON list of two-to-four option legs")
+    mleg.add_argument("legs")
+    mleg.add_argument("--limit-price", type=float)
+    mleg.add_argument("--client-order-id")
+    mleg.add_argument("--idempotency-key")
+    mleg.add_argument("-a", "--account")
+
+    watchlist = sub.add_parser("watchlist", help="persistent named watchlists")
+    watch_sub = watchlist.add_subparsers(dest="watch_cmd", required=True)
+    watch_create = watch_sub.add_parser("create")
+    watch_create.add_argument("name")
+    watch_create.add_argument("--symbols", default="")
+    watch_create.add_argument("-a", "--account")
+    watch_sub.add_parser("list").add_argument("-a", "--account")
+    for command in ("get", "delete", "quotes"):
+        parser = watch_sub.add_parser(command)
+        parser.add_argument("watchlist")
+        parser.add_argument("-a", "--account")
+    for command in ("add", "remove"):
+        parser = watch_sub.add_parser(command)
+        parser.add_argument("watchlist")
+        parser.add_argument("symbol")
+        parser.add_argument("-a", "--account")
+
+    data = sub.add_parser("data", help="market data and research")
+    data_sub = data.add_subparsers(dest="data_cmd", required=True)
+    for command in ("bars", "quotes", "trades"):
+        parser = data_sub.add_parser(command)
+        parser.add_argument("symbol")
+        parser.add_argument("--start")
+        parser.add_argument("--end")
+        parser.add_argument("--timeframe", default="1Day")
+        parser.add_argument("--limit", type=int, default=100)
+    for command in (
+        "latest-bar",
+        "latest-quote",
+        "latest-trade",
+        "snapshot",
+        "crypto-orderbook",
+    ):
+        data_sub.add_parser(command).add_argument("symbol")
+    news = data_sub.add_parser("news")
+    news.add_argument("symbol")
+    news.add_argument("--limit", type=int, default=10)
+    active = data_sub.add_parser("most-actives")
+    active.add_argument("--limit", type=int, default=20)
+    movers = data_sub.add_parser("movers")
+    movers.add_argument("--limit", type=int, default=10)
+    forex = data_sub.add_parser("forex")
+    forex.add_argument("pair", help="for example USD/EUR")
+
+    asset = sub.add_parser("asset", help="asset discovery")
+    asset_sub = asset.add_subparsers(dest="asset_cmd", required=True)
+    asset_sub.add_parser("list").add_argument("--limit", type=int, default=20)
+    asset_sub.add_parser("get").add_argument("symbol")
+    asset_search_parser = asset_sub.add_parser("search")
+    asset_search_parser.add_argument("query")
+    asset_search_parser.add_argument("--limit", type=int, default=8)
+
+    chain = sub.add_parser("chain", help="list option expiries/strikes")
+    chain.add_argument("underlying")
+    chain.add_argument("expiry", nargs="?")
     find = sub.add_parser("find", help="search tradable symbols")
     find.add_argument("query")
     find.add_argument("--limit", type=int, default=8)
-    val = sub.add_parser("validate", help="validate and quote a symbol")
-    val.add_argument("symbol")
+    sub.add_parser("validate").add_argument("symbol")
+    sub.add_parser("quote").add_argument("symbol")
     sub.add_parser("market", help="NYSE status and next open/close")
+    calendar = sub.add_parser("calendar")
+    calendar.add_argument("--start")
+    calendar.add_argument("--end")
+    activity = sub.add_parser("activity")
+    activity.add_argument("-a", "--account")
+    activity.add_argument("--type")
+    activity.add_argument("--start")
+    activity.add_argument("--end")
+    activity.add_argument("--limit", type=int, default=100)
     sub.add_parser("tick")
-    for cmd in ("positions", "orders", "pnl", "perf"):
-        sub.add_parser(cmd).add_argument("-a", "--account")
-    rn = sub.add_parser("rename", help="rename a portfolio")
-    rn.add_argument("old")
-    rn.add_argument("new")
-    cl = sub.add_parser("close", help="flatten a position at market")
-    cl.add_argument("symbol")
-    cl.add_argument("-a", "--account")
-    pv = sub.add_parser("preview", help="dry-run an order with risk checks")
-    pv.add_argument("side", choices=["buy", "sell"])
-    pv.add_argument("symbol")
-    pv.add_argument("qty", type=float)
-    pv.add_argument("--price", type=float)
-    pv.add_argument("-a", "--account")
-    risk = sub.add_parser("risk", help="show or change account risk limits")
+    for command in ("positions", "orders", "pnl", "perf"):
+        sub.add_parser(command).add_argument("-a", "--account")
+    rename = sub.add_parser("rename")
+    rename.add_argument("old")
+    rename.add_argument("new")
+    close = sub.add_parser("close")
+    close.add_argument("symbol")
+    close.add_argument("-a", "--account")
+    close.add_argument("--qty", type=float)
+    close.add_argument("--percent", type=float)
+    preview = sub.add_parser("preview")
+    preview.add_argument("side", choices=["buy", "sell"])
+    preview.add_argument("symbol")
+    preview.add_argument("qty", type=float)
+    preview.add_argument("--price", type=float)
+    preview.add_argument("-a", "--account")
+    risk = sub.add_parser("risk")
     risk.add_argument("-a", "--account")
     risk.add_argument("--allow-short", action=argparse.BooleanOptionalAction)
     risk.add_argument("--allow-naked-options", action=argparse.BooleanOptionalAction)
     risk.add_argument("--max-leverage", type=float)
     risk.add_argument("--max-order", type=float)
     risk.add_argument("--clear-max-order", action="store_true")
-    acts = sub.add_parser("actions", help="sync stock dividends and splits")
-    acts.add_argument("-a", "--account")
-    audit = sub.add_parser("audit", help="show attributed mutation history")
+    actions = sub.add_parser("actions")
+    actions.add_argument("-a", "--account")
+    audit = sub.add_parser("audit")
     audit.add_argument("-a", "--account")
     audit.add_argument("--limit", type=int, default=50)
-    export = sub.add_parser("export", help="export order history as CSV")
+    export = sub.add_parser("export")
     export.add_argument("-a", "--account")
     export.add_argument("--limit", type=int, default=5000)
-    sub.add_parser("backup", help="create an online SQLite backup")
-    sub.add_parser("dash", help="live dashboard")
-    sub.add_parser("cancel", help="cancel pending order").add_argument(
-        "order_id", type=int
-    )
-    r = sub.add_parser("rm", help="delete account")
-    r.add_argument("name")
-    r.add_argument("--yes", action="store_true")
-    r = sub.add_parser("reset", help="wipe trades, restore cash")
-    r.add_argument("name")
-    r.add_argument("--cash", type=float, default=100_000)
-    for cmd in ("deposit", "withdraw"):
-        d = sub.add_parser(cmd)
-        d.add_argument("amount", type=float)
-        d.add_argument("-a", "--account")
-    a = p.parse_args(argv)
+    sub.add_parser("backup")
+    sub.add_parser("doctor")
+    sub.add_parser("dash")
+    sub.add_parser("cancel").add_argument("order_id", type=int)
+    remove = sub.add_parser("rm")
+    remove.add_argument("name")
+    remove.add_argument("--yes", action="store_true")
+    reset = sub.add_parser("reset")
+    reset.add_argument("name")
+    reset.add_argument("--cash", type=float, default=100_000)
+    for command in ("deposit", "withdraw"):
+        parser = sub.add_parser(command)
+        parser.add_argument("amount", type=float)
+        parser.add_argument("-a", "--account")
+    return p
 
-    if a.cmd == "dash":
+
+def _emit_mode(mode, output):
+    if mode == "quiet":
+        return
+    if mode == "json":
+        try:
+            parsed = json.loads(output)
+        except json.JSONDecodeError:
+            parsed = {"ok": True, "output": output.rstrip().splitlines()}
+        print(json.dumps(parsed, indent=2))
+        return
+    writer = csv.writer(sys.stdout)
+    try:
+        parsed = json.loads(output)
+    except json.JSONDecodeError:
+        parsed = None
+    rows = (
+        parsed
+        if isinstance(parsed, list)
+        else [parsed]
+        if isinstance(parsed, dict)
+        else []
+    )
+    if rows and all(isinstance(row, dict) for row in rows):
+        fields = list(dict.fromkeys(key for row in rows for key in row))
+        writer.writerow(fields)
+        writer.writerows(
+            [
+                json.dumps(row.get(field))
+                if isinstance(row.get(field), (dict, list))
+                else row.get(field)
+                for field in fields
+            ]
+            for row in rows
+        )
+    else:
+        writer.writerow(["output"])
+        writer.writerows([[line] for line in output.rstrip().splitlines()])
+
+
+def main(argv=None, _inner=False):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not _inner:
+        if "--schema" in argv:
+            print(json.dumps(CLI_COMMAND_TREE, indent=2))
+            return
+        argv = ["--help" if value == "--help-all" else value for value in argv]
+        modes = [mode for mode in ("json", "csv", "quiet") if f"--{mode}" in argv]
+        if len(modes) > 1:
+            raise SystemExit("choose only one of --json, --csv, or --quiet")
+        if modes:
+            cleaned = [value for value in argv if value != f"--{modes[0]}"]
+            buffer = io.StringIO()
+            errors = io.StringIO()
+            try:
+                with (
+                    contextlib.redirect_stdout(buffer),
+                    contextlib.redirect_stderr(errors),
+                ):
+                    main(cleaned, _inner=True)
+            except SystemExit as exc:
+                message = errors.getvalue().strip() or str(exc)
+                print(json.dumps({"ok": False, "error": message}), file=sys.stderr)
+                raise SystemExit(1) from None
+            _emit_mode(modes[0], buffer.getvalue())
+            return
+    if not argv:
+        argv = ["dash"]
+    args = _build_parser().parse_args(argv)
+    _run_cli(args)
+
+
+def _run_cli(args):
+    if args.cmd == "dash":
         script = os.path.join(
             os.path.dirname(os.path.realpath(__file__)), "dashboard.py"
         )
         os.execv(sys.executable, [sys.executable, script])
-    if a.cmd == "chain":
-        show_chain(a.underlying, a.expiry)
+    if args.cmd == "chain":
+        show_chain(args.underlying, args.expiry)
         return
-    if a.cmd == "find":
-        print(json.dumps(search_assets(a.query, a.limit), indent=2))
-        return
-    if a.cmd == "market":
-        print(json.dumps(market_clock(), indent=2))
-        return
-    if a.cmd == "validate":
-        print(json.dumps(validate_asset(a.symbol), indent=2))
+    if args.cmd in ("find", "validate", "quote", "market", "calendar", "data", "asset"):
+        if args.cmd == "find":
+            result = search_assets(args.query, args.limit)
+        elif args.cmd == "validate":
+            result = validate_asset(args.symbol)
+        elif args.cmd == "quote":
+            result = latest_quote(args.symbol)
+        elif args.cmd == "market":
+            result = market_clock()
+        elif args.cmd == "calendar":
+            result = market_calendar(args.start, args.end)
+        elif args.cmd == "asset":
+            if args.asset_cmd == "get":
+                result = validate_asset(args.symbol)
+            elif args.asset_cmd == "search":
+                result = search_assets(args.query, args.limit)
+            else:
+                result = market_screener("most_actives", args.limit)
+        elif args.data_cmd in ("bars", "quotes", "trades"):
+            result = market_history(
+                args.symbol,
+                args.data_cmd,
+                args.start,
+                args.end,
+                args.timeframe,
+                args.limit,
+            )
+        elif args.data_cmd == "latest-bar":
+            rows = market_history(args.symbol, "bars", timeframe="1Day", limit=1)[
+                "data"
+            ]
+            result = rows[-1] if rows else None
+        elif args.data_cmd == "latest-quote":
+            result = latest_quote(args.symbol)
+        elif args.data_cmd == "latest-trade":
+            result = latest_trade(args.symbol)
+        elif args.data_cmd == "snapshot":
+            result = market_snapshot(args.symbol)
+        elif args.data_cmd == "news":
+            result = market_news(args.symbol, args.limit)
+        elif args.data_cmd == "most-actives":
+            result = market_screener("most_actives", args.limit)
+        elif args.data_cmd == "movers":
+            result = {
+                "gainers": market_screener("day_gainers", args.limit),
+                "losers": market_screener("day_losers", args.limit),
+            }
+        elif args.data_cmd == "crypto-orderbook":
+            result = crypto_orderbook(args.symbol)
+        else:
+            pair = args.pair.upper().replace("/", "")
+            if len(pair) != 6:
+                raise SystemExit("forex pair must look like USD/EUR")
+            result = latest_quote(f"{pair}=X")
+        print(json.dumps(result, indent=2))
         return
 
     conn = db()
-    with conn:
-        if a.cmd == "new":
-            made_default = create_account(conn, a.name, a.cash)
-            suffix = " (set as default)" if made_default else ""
-            print(f"created '{a.name}' with {a.cash:,.2f}{suffix}")
-        elif a.cmd == "accounts":
-            default = (
-                resolve_account(conn, None)
-                if conn.execute(
-                    "SELECT 1 FROM config WHERE key='default_account'"
-                ).fetchone()
-                else None
+    try:
+        if args.cmd == "new":
+            made_default = create_account(conn, args.name, args.cash)
+            print(
+                f"created '{args.name}' with {args.cash:,.2f}"
+                + (" (set as default)" if made_default else "")
             )
-            for name, cash in conn.execute("SELECT name, cash FROM accounts"):
-                mark = " *" if name == default else ""
-                print(f"{name:<16}{cash:>14,.2f}{mark}")
-        elif a.cmd == "use":
-            set_default(conn, a.name)
-        elif a.cmd in ("buy", "sell"):
-            a.account = resolve_account(conn, a.account)
-            place(conn, a.account, a.symbol, a.cmd, a.qty, a.limit)
-        elif a.cmd == "option":
-            account = resolve_account(conn, a.account)
-            occ = build_occ(a.underlying, a.expiry, a.strike, a.kind)
-            place(conn, account, occ, a.osub, a.qty, a.limit)
-        elif a.cmd == "rename":
-            rename_account(conn, a.old, a.new)
-        elif a.cmd == "close":
-            close_position(conn, resolve_account(conn, a.account), a.symbol)
-        elif a.cmd == "preview":
-            account = resolve_account(conn, a.account)
+        elif args.cmd == "accounts":
+            default = conn.execute(
+                "SELECT value FROM config WHERE key='default_account'"
+            ).fetchone()
+            result = [
+                {
+                    "name": name,
+                    "cash": cash,
+                    "default": bool(default and name == default[0]),
+                }
+                for name, cash in conn.execute(
+                    "SELECT name,cash FROM accounts ORDER BY name"
+                )
+            ]
+            print(json.dumps(result, indent=2))
+        elif args.cmd == "use":
+            set_default(conn, args.name)
+        elif args.cmd in ("buy", "sell"):
+            place(
+                conn,
+                resolve_account(conn, args.account),
+                args.symbol,
+                args.cmd,
+                args.qty,
+                args.limit,
+            )
+        elif args.cmd == "order":
+            if args.order_cmd == "submit":
+                account = resolve_account(conn, args.account)
+                tp = (
+                    {"limit_price": args.take_profit}
+                    if args.take_profit is not None
+                    else None
+                )
+                sl = (
+                    {"stop_price": args.stop_loss, "limit_price": args.stop_loss_limit}
+                    if args.stop_loss is not None
+                    else None
+                )
+                submit_order(
+                    conn,
+                    account,
+                    args.symbol,
+                    args.side,
+                    args.qty,
+                    args.notional,
+                    args.type,
+                    args.limit_price,
+                    args.stop_price,
+                    args.trail_price,
+                    args.trail_percent,
+                    args.time_in_force,
+                    args.extended_hours,
+                    args.client_order_id,
+                    args.order_class,
+                    tp,
+                    sl,
+                    dry_run=args.dry_run,
+                    source="cli",
+                    request_id=args.idempotency_key or args.client_order_id,
+                )
+            elif args.order_cmd == "get":
+                account = (
+                    resolve_account(conn, args.account)
+                    if args.client_order_id
+                    else args.account
+                )
+                print(
+                    json.dumps(
+                        get_order(conn, args.order_id, args.client_order_id, account),
+                        indent=2,
+                    )
+                )
+            elif args.order_cmd == "list":
+                account = resolve_account(conn, args.account)
+                columns = (
+                    "id,account,symbol,side,qty,limit_price,status,filled_price,ts,source,request_id,"
+                    "reject_reason,order_type,stop_price,trail_price,trail_percent,hwm,time_in_force,"
+                    "extended_hours,notional,client_order_id,replaced_by,parent_id,order_class,triggered"
+                )
+                params = [account]
+                where = "account=?"
+                if args.status != "all":
+                    where += " AND status=?"
+                    params.append(args.status)
+                rows = conn.execute(
+                    f"SELECT {columns} FROM orders WHERE {where} ORDER BY id DESC",
+                    params,
+                ).fetchall()
+                print(json.dumps([_order_dict(row) for row in rows], indent=2))
+            elif args.order_cmd == "replace":
+                replace_order(
+                    conn,
+                    args.order_id,
+                    args.qty,
+                    args.limit_price,
+                    args.stop_price,
+                    args.trail,
+                    args.time_in_force,
+                    args.client_order_id,
+                    request_id=args.idempotency_key,
+                )
+            elif args.order_cmd == "cancel":
+                cancel(conn, args.order_id, request_id=args.idempotency_key)
+            else:
+                cancel_all_orders(conn, args.account, request_id=args.idempotency_key)
+        elif args.cmd == "position":
+            account = resolve_account(conn, args.account)
+            if args.position_cmd == "list":
+                print(json.dumps(list_positions(conn, account), indent=2))
+            elif args.position_cmd == "get":
+                print(json.dumps(get_position(conn, account, args.symbol), indent=2))
+            elif args.position_cmd == "close":
+                close_position(
+                    conn,
+                    account,
+                    args.symbol,
+                    args.qty,
+                    args.percent,
+                    request_id=args.idempotency_key,
+                )
+            else:
+                close_all_positions(conn, account, request_id=args.idempotency_key)
+        elif args.cmd == "option":
+            if args.osub == "get":
+                print(json.dumps(option_contract_details(args.symbol), indent=2))
+            else:
+                account = resolve_account(conn, args.account)
+                if args.osub in ("buy", "sell"):
+                    symbol = build_occ(
+                        args.underlying, args.expiry, args.strike, args.kind
+                    )
+                    place(conn, account, symbol, args.osub, args.qty, args.limit)
+                elif args.osub == "exercise":
+                    exercise_option(
+                        conn,
+                        account,
+                        args.symbol,
+                        args.qty,
+                        request_id=args.idempotency_key,
+                    )
+                elif args.osub == "do-not-exercise":
+                    do_not_exercise_option(
+                        conn, account, args.symbol, request_id=args.idempotency_key
+                    )
+                else:
+                    try:
+                        legs = json.loads(args.legs)
+                    except json.JSONDecodeError as exc:
+                        raise SystemExit(f"invalid legs JSON: {exc}") from None
+                    submit_option_multileg(
+                        conn,
+                        account,
+                        legs,
+                        args.limit_price,
+                        request_id=args.idempotency_key or args.client_order_id,
+                        client_order_id=args.client_order_id,
+                    )
+        elif args.cmd == "watchlist":
+            account = resolve_account(conn, args.account)
+            if args.watch_cmd == "create":
+                create_watchlist(conn, account, args.name, args.symbols)
+            elif args.watch_cmd == "list":
+                print(json.dumps(list_watchlists(conn, account), indent=2))
+            elif args.watch_cmd == "get":
+                print(
+                    json.dumps(get_watchlist(conn, account, args.watchlist), indent=2)
+                )
+            elif args.watch_cmd == "quotes":
+                print(
+                    json.dumps(
+                        watchlist_quotes(conn, account, args.watchlist), indent=2
+                    )
+                )
+            elif args.watch_cmd == "add":
+                add_watchlist_symbol(conn, account, args.watchlist, args.symbol)
+            elif args.watch_cmd == "remove":
+                remove_watchlist_symbol(conn, account, args.watchlist, args.symbol)
+            else:
+                delete_watchlist(conn, account, args.watchlist)
+        elif args.cmd == "rename":
+            rename_account(conn, args.old, args.new)
+        elif args.cmd == "close":
+            close_position(
+                conn,
+                resolve_account(conn, args.account),
+                args.symbol,
+                args.qty,
+                args.percent,
+            )
+        elif args.cmd == "preview":
             print(
                 json.dumps(
-                    preview_order(conn, account, a.symbol, a.side, a.qty, a.price),
+                    preview_order(
+                        conn,
+                        resolve_account(conn, args.account),
+                        args.symbol,
+                        args.side,
+                        args.qty,
+                        args.price,
+                    ),
                     indent=2,
                 )
             )
-        elif a.cmd == "risk":
-            account = resolve_account(conn, a.account)
-            if (
-                any(
-                    value is not None
-                    for value in (
-                        a.allow_short,
-                        a.allow_naked_options,
-                        a.max_leverage,
-                        a.max_order,
-                    )
-                )
-                or a.clear_max_order
-            ):
-                set_risk_limits(
-                    conn,
-                    account,
-                    a.allow_short,
-                    a.allow_naked_options,
-                    a.max_leverage,
-                    a.max_order,
-                    a.clear_max_order,
-                )
+        elif args.cmd == "risk":
+            account = resolve_account(conn, args.account)
+            changes = (
+                args.allow_short,
+                args.allow_naked_options,
+                args.max_leverage,
+                args.max_order,
+            )
+            if any(value is not None for value in changes) or args.clear_max_order:
+                set_risk_limits(conn, account, *changes, args.clear_max_order)
             else:
                 print(json.dumps(risk_limits(conn, account), indent=2))
-        elif a.cmd == "actions":
-            sync_corporate_actions(conn, a.account)
-        elif a.cmd == "audit":
-            for row in audit_events(conn, a.account, a.limit):
-                oid, ts, source, request_id, action, account, details = row
-                key = f" key={request_id}" if request_id else ""
-                print(
-                    f"#{oid} {ts} [{source}] {action} {account or '-'}{key} {details}"
-                )
-        elif a.cmd == "export":
+        elif args.cmd == "activity":
+            account = resolve_account(conn, args.account)
             print(
-                trade_history_csv(conn, resolve_account(conn, a.account), a.limit),
+                json.dumps(
+                    account_activities(
+                        conn, account, args.type, args.start, args.end, args.limit
+                    ),
+                    indent=2,
+                )
+            )
+        elif args.cmd == "actions":
+            sync_corporate_actions(conn, args.account)
+        elif args.cmd == "audit":
+            print(
+                json.dumps(
+                    [
+                        {
+                            "id": row[0],
+                            "timestamp": row[1],
+                            "source": row[2],
+                            "request_id": row[3],
+                            "action": row[4],
+                            "account": row[5],
+                            "details": json.loads(row[6] or "{}"),
+                        }
+                        for row in audit_events(conn, args.account, args.limit)
+                    ],
+                    indent=2,
+                )
+            )
+        elif args.cmd == "export":
+            print(
+                trade_history_csv(
+                    conn, resolve_account(conn, args.account), args.limit
+                ),
                 end="",
             )
-        elif a.cmd == "backup":
+        elif args.cmd == "backup":
             print(backup_database(conn))
-        elif a.cmd == "cancel":
-            cancel(conn, a.order_id)
-        elif a.cmd == "rm":
+        elif args.cmd == "doctor":
+            print(json.dumps(healthcheck(conn), indent=2))
+        elif args.cmd == "cancel":
+            cancel(conn, args.order_id)
+        elif args.cmd == "rm":
             if (
-                not a.yes
-                and input(f"delete '{a.name}' and all its history? [y/N] ").lower()
+                not args.yes
+                and input(f"delete '{args.name}' and all its history? [y/N] ").lower()
                 != "y"
             ):
                 raise SystemExit("aborted")
-            wipe_account(conn, a.name)
-        elif a.cmd == "reset":
-            wipe_account(conn, a.name, reset_cash=a.cash)
-        elif a.cmd in ("deposit", "withdraw"):
-            account = resolve_account(conn, a.account)
-            adjust_cash(conn, account, a.amount if a.cmd == "deposit" else -a.amount)
-        elif a.cmd == "tick":
+            wipe_account(conn, args.name)
+        elif args.cmd == "reset":
+            wipe_account(conn, args.name, reset_cash=args.cash)
+        elif args.cmd in ("deposit", "withdraw"):
+            adjust_cash(
+                conn,
+                resolve_account(conn, args.account),
+                args.amount if args.cmd == "deposit" else -args.amount,
+            )
+        elif args.cmd == "tick":
             tick(conn)
-        elif a.cmd in ("positions", "orders", "pnl", "perf"):
-            a.account = resolve_account(conn, a.account)
-        if a.cmd == "positions":
-            for symbol, qty, avg, ac in conn.execute(
-                "SELECT symbol, qty, avg_cost, asset_class FROM positions WHERE account=?",
-                (a.account,),
-            ):
-                side = "long" if qty > 0 else "short"
-                print(f"{symbol:<22}{ac:<8}{side:<6}{abs(qty):>8g}{avg:>11.2f}")
-        elif a.cmd == "orders":
-            for row in conn.execute(
-                "SELECT id,ts,side,qty,symbol,limit_price,status,filled_price"
-                " FROM orders WHERE account=? ORDER BY id",
-                (a.account,),
-            ):
-                oid, ts, side, qty, symbol, limit, status, fp = row
-                px = f"@{fp:.2f}" if fp else (f"lim {limit:.2f}" if limit else "")
-                print(f"#{oid} {ts} {side} {qty:g} {symbol} {px} [{status}]")
-        elif a.cmd == "pnl":
-            pnl(conn, a.account)
-        elif a.cmd == "perf":
-            show_perf(conn, a.account)
-    conn.close()
+        elif args.cmd in ("positions", "orders", "pnl", "perf"):
+            account = resolve_account(conn, args.account)
+            if args.cmd == "positions":
+                print(json.dumps(list_positions(conn, account), indent=2))
+            elif args.cmd == "orders":
+                for row in conn.execute(
+                    "SELECT id,ts,side,qty,symbol,order_type,limit_price,stop_price,status,filled_price"
+                    " FROM orders WHERE account=? ORDER BY id",
+                    (account,),
+                ):
+                    oid, ts, side, qty, symbol, kind, limit, stop, status, filled = row
+                    price = (
+                        f"@{filled:.2f}"
+                        if filled is not None
+                        else f"lim {limit:.2f}"
+                        if limit is not None
+                        else f"stop {stop:.2f}"
+                        if stop is not None
+                        else ""
+                    )
+                    print(
+                        f"#{oid} {ts} {side} {qty:g} {symbol} {kind} {price} [{status}]"
+                    )
+            elif args.cmd == "pnl":
+                pnl(conn, account)
+            else:
+                show_perf(conn, account)
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
