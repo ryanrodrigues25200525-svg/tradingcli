@@ -11,6 +11,7 @@ import os
 import select
 import sys
 import termios
+import threading
 import time
 import tty
 from concurrent.futures import ThreadPoolExecutor
@@ -179,17 +180,49 @@ def _pending_order_label(order):
     return f"#{oid} {side} {qty:g} {symbol} {trigger} {tif}"
 
 
+_market_status = {"line": None, "computed_at": 0.0, "computing": False}
+_market_status_lock = threading.Lock()
+
+
+def _refresh_market_status():
+    """Kick off a background computation of market open/closed, if not already running."""
+    with _market_status_lock:
+        if _market_status["computing"]:
+            return
+        _market_status["computing"] = True
+
+    def worker():
+        try:
+            clock = pt.market_clock()
+            transition = clock.get("next_transition") or {}
+            eastern = transition.get("eastern", "")
+            when = f" · next {clock['transition']} {eastern[11:16]} ET" if eastern else ""
+            if clock["is_open"]:
+                line = f"[green]●[/green]  Market open — NYSE{when}"
+            else:
+                line = f"[{GREY}]■[/{GREY}]  Market closed{when}"
+        except Exception:
+            line = f"[{GREY}]■[/{GREY}]  Market status unavailable"
+        with _market_status_lock:
+            _market_status["line"] = line
+            _market_status["computed_at"] = time.monotonic()
+            _market_status["computing"] = False
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 def _market_banner(keys):
-    clock = pt.market_clock()
-    transition = clock.get("next_transition") or {}
-    eastern = transition.get("eastern", "")
-    when = ""
-    if eastern:
-        when = f" · next {clock['transition']} {eastern[11:16]} ET"
-    if clock["is_open"]:
-        status = f"[green]●[/green]  Market open — NYSE{when}"
-    else:
-        status = f"[{GREY}]■[/{GREY}]  Market closed{when}"
+    # pt.market_clock() first-call cost (~0.5-0.7s: lazy pandas + exchange_calendars
+    # import and NYSE calendar construction) used to block the very first frame.
+    # Market open/closed barely changes, so compute it off-thread and show a
+    # placeholder until it lands; a 60s TTL keeps it accurate without ever
+    # blocking a redraw again.
+    with _market_status_lock:
+        line = _market_status["line"]
+        stale = time.monotonic() - _market_status["computed_at"] > 60
+    if line is None or stale:
+        _refresh_market_status()
+    status = line or "[dim]●  checking market status…[/dim]"
     stamp = datetime.now().strftime("%H:%M:%S")
     status_line = Text.from_markup(f"{status}   [dim]as of {stamp}[/dim]")
     return Panel(Group(status_line, keys), border_style=RED)
