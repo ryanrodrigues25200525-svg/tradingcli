@@ -1832,7 +1832,7 @@ def close_all_positions(
     return ids
 
 
-def get_position(conn, account, symbol, price_fn=live_price):
+def get_position(conn, account, symbol, price_fn=live_price, price=None):
     symbol = symbol.strip().upper()
     row = conn.execute(
         "SELECT qty,avg_cost,mult,asset_class,margin FROM positions"
@@ -1842,7 +1842,8 @@ def get_position(conn, account, symbol, price_fn=live_price):
     if not row:
         raise SystemExit(f"no open position in {symbol}")
     qty, avg, mult, asset_class, margin = row
-    price = price_fn(symbol)
+    if price is None:
+        price = price_fn(symbol)
     unrealized = qty * mult * (price - avg)
     market_value = (
         margin + unrealized if asset_class == "future" else qty * mult * price
@@ -1872,7 +1873,11 @@ def list_positions(conn, account, price_fn=live_price):
             "SELECT symbol FROM positions WHERE account=? ORDER BY symbol", (account,)
         )
     ]
-    return [get_position(conn, account, symbol, price_fn) for symbol in symbols]
+    marks = batch_prices(symbols, price_fn=price_fn)
+    return [
+        get_position(conn, account, symbol, price_fn, price=marks[symbol])
+        for symbol in symbols
+    ]
 
 
 def option_contract_details(symbol, price_fn=live_price):
@@ -3370,10 +3375,11 @@ def pnl(conn, account, price_fn=live_price):
         " FROM positions WHERE account=?",
         (account,),
     ).fetchall()
+    marks = batch_prices([p[0] for p in positions], price_fn=price_fn)
     equity, unreal = cash, 0.0
     print(f"{'symbol':<22}{'side':<6}{'qty':>7}{'avg':>11}{'last':>11}{'unreal':>13}")
     for symbol, qty, avg, mult, ac, margin in positions:
-        price = price_fn(symbol)
+        price = marks[symbol]
         u = qty * mult * (price - avg)
         unreal += u
         equity += (u + margin) if ac == "future" else qty * mult * price
@@ -3419,7 +3425,9 @@ def _daily_closes(symbols, start, end):
 
     if len(ordered) < 2:
         return dict(fetch(symbol) for symbol in ordered)
-    with ThreadPoolExecutor(max_workers=min(8, len(ordered))) as executor:
+    # Network I/O bound, not CPU bound -- see batch_prices() below for why
+    # this is sized to the task count instead of a small fixed pool.
+    with ThreadPoolExecutor(max_workers=min(48, len(ordered))) as executor:
         return dict(executor.map(fetch, ordered))
 
 
@@ -3438,7 +3446,11 @@ def batch_prices(symbols, price_fn=None, ignore_errors=False):
 
     if len(ordered) < 2:
         return dict(fetch(symbol) for symbol in ordered)
-    with ThreadPoolExecutor(max_workers=min(8, len(ordered))) as executor:
+    # Network I/O bound (waiting on Yahoo Finance responses), not CPU bound,
+    # so one worker per symbol lets them all run concurrently instead of
+    # queuing behind a small fixed pool — capped to avoid opening an
+    # unreasonable number of connections for a very large portfolio.
+    with ThreadPoolExecutor(max_workers=min(48, len(ordered))) as executor:
         return dict(executor.map(fetch, ordered))
 
 
