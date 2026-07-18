@@ -348,23 +348,43 @@ def render(data, quotes, default, prev=None, scroll=0, total=None):
     return Group(*parts)
 
 
+_ARROWS = {b"A": "UP", b"B": "DOWN", b"C": "RIGHT", b"D": "LEFT"}
+_pending_keys = b""
+
+
+def _pop_key(buf):
+    """Split one key (or arrow escape sequence) off the front of buf."""
+    if buf[:1] == b"\x1b" and len(buf) >= 3 and buf[1:2] == b"[":
+        code = _ARROWS.get(buf[2:3])
+        if code:
+            return code, buf[3:]
+    try:
+        return buf[:1].decode(), buf[1:]
+    except UnicodeDecodeError:
+        return None, buf[1:]
+
+
 def read_key(timeout):
+    """Return the next keypress, or None. Arrow keys decode to UP/DOWN/LEFT/RIGHT.
+
+    Reads whatever bytes the terminal has buffered in one shot instead of
+    polling byte-by-byte for the rest of an escape sequence — polling with
+    short per-byte timeouts can miss the trailing bytes under any latency
+    (ssh, tmux) and silently drop the keypress.
+    """
+    global _pending_keys
     if not sys.stdin.isatty():
         time.sleep(timeout)
         return None
-    r, _, _ = select.select([sys.stdin], [], [], timeout)
-    if not r:
-        return None
-    ch = sys.stdin.read(1)
-    if ch != "\x1b":
-        return ch
-    # escape sequence — arrow keys are ESC [ A/B/C/D
-    r, _, _ = select.select([sys.stdin], [], [], 0.01)
-    if not r or sys.stdin.read(1) != "[":
-        return ch
-    r, _, _ = select.select([sys.stdin], [], [], 0.01)
-    code = sys.stdin.read(1) if r else ""
-    return {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT"}.get(code, ch)
+    if not _pending_keys:
+        r, _, _ = select.select([sys.stdin], [], [], timeout)
+        if not r:
+            return None
+        _pending_keys = os.read(sys.stdin.fileno(), 64)
+        if not _pending_keys:
+            return None
+    key, _pending_keys = _pop_key(_pending_keys)
+    return key
 
 
 def run_tick(prices):
