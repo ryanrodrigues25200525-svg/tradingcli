@@ -65,21 +65,64 @@ def snapshot(account_filter=None):
 
 
 def fetch_quotes(symbols):
-    """{symbol: (last, prev_close) | None}. Options priced via chain (no prev_close)."""
+    """{symbol: (last, prev_close) | None}. Options priced via chain (no prev_close).
+
+    Option legs are grouped by (underlying, expiry) and each chain is downloaded
+    once — a portfolio with several strikes on the same underlying/expiry (common
+    with spreads, condors, butterflies) previously re-downloaded that whole chain
+    once per leg, which dominated refresh time as position count grew.
+    """
     import yfinance as yf
 
-    def get(s):
+    stocks, option_groups = [], {}
+    for s in symbols:
+        if pt.OCC_RE.match(s):
+            root, expiry, strike, cp = pt.parse_occ(s)
+            option_groups.setdefault((root, expiry), []).append((s, strike, cp))
+        else:
+            stocks.append(s)
+
+    def get_stock(s):
         try:
-            if pt.OCC_RE.match(s):
-                return s, (pt.option_price(s), None)  # options: no clean prev close
             fi = yf.Ticker(s).fast_info
             pc = fi.get("previousClose")
-            return s, (float(fi["lastPrice"]), float(pc) if pc else None)
+            return {s: (float(fi["lastPrice"]), float(pc) if pc else None)}
         except Exception:
-            return s, None  # render as '?', retry next cycle
+            return {s: None}  # render as '?', retry next cycle
 
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        return dict(ex.map(get, symbols))
+    def get_option_group(root, expiry, legs):
+        try:
+            chain = yf.Ticker(root).option_chain(expiry)
+        except Exception:
+            return {sym: None for sym, _strike, _cp in legs}
+        out = {}
+        for sym, strike, cp in legs:
+            try:
+                df = chain.calls if cp == "C" else chain.puts
+                r = df[df.strike == strike].iloc[0]
+                bid, ask, last = float(r.bid), float(r.ask), float(r.lastPrice)
+                mid = (bid + ask) / 2 if bid > 0 and ask > 0 else last
+                out[sym] = (mid, None) if mid > 0 else None
+            except Exception:
+                out[sym] = None
+        return out
+
+    task_count = len(stocks) + len(option_groups)
+    # This is network I/O bound (waiting on Yahoo Finance responses), not CPU
+    # bound, so one worker per request lets them all run concurrently instead
+    # of queuing behind a small fixed pool — capped to avoid opening an
+    # unreasonable number of connections if a portfolio gets huge.
+    max_workers = min(48, max(1, task_count))
+    quotes = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(get_stock, s) for s in stocks]
+        futures += [
+            ex.submit(get_option_group, root, expiry, legs)
+            for (root, expiry), legs in option_groups.items()
+        ]
+        for fut in futures:
+            quotes.update(fut.result())
+    return quotes
 
 
 def braille_chart(values, width=74, height=16):
