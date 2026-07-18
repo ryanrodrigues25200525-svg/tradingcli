@@ -179,7 +179,7 @@ def _pending_order_label(order):
     return f"#{oid} {side} {qty:g} {symbol} {trigger} {tif}"
 
 
-def _market_banner():
+def _market_banner(keys):
     clock = pt.market_clock()
     transition = clock.get("next_transition") or {}
     eastern = transition.get("eastern", "")
@@ -191,7 +191,8 @@ def _market_banner():
     else:
         status = f"[{GREY}]■[/{GREY}]  Market closed{when}"
     stamp = datetime.now().strftime("%H:%M:%S")
-    return Panel(f"{status}   [dim]as of {stamp}[/dim]", border_style=RED)
+    status_line = Text.from_markup(f"{status}   [dim]as of {stamp}[/dim]")
+    return Panel(Group(status_line, keys), border_style=RED)
 
 
 def _account_totals(cash, deposits, realized, pos, quotes):
@@ -259,10 +260,8 @@ def render_compact(data, quotes, default):
     return Group(
         Text.from_markup(f"[bold {RED}]{LOGO}[/bold {RED}]"),
         "",
-        _market_banner(),
+        _market_banner(keys),
         Panel(t, title="[bold]ALL PORTFOLIOS[/bold]", title_align="left", border_style=RED),
-        "",
-        keys,
     )
 
 
@@ -367,8 +366,6 @@ def render(data, quotes, default, prev=None, scroll=0, total=None):
             )
         )
 
-    banner = _market_banner()
-
     keys = Text.from_markup(
         f"[dim][bold]v[/bold] Compact view  [{RED}]●[/{RED}]  [bold]b[/bold] Buy  [{RED}]●[/{RED}]  "
         f"[bold]s[/bold] Sell  [{RED}]●[/{RED}]  "
@@ -378,6 +375,8 @@ def render(data, quotes, default, prev=None, scroll=0, total=None):
         f"[{RED}]●[/{RED}]  [bold]↑/↓[/bold] Scroll  [{RED}]●[/{RED}]  [bold]t[/bold] Tick  [{RED}]●[/{RED}]  "
         f"[bold]r[/bold] Refresh  [{RED}]●[/{RED}]  [bold]q[/bold] Quit[/dim]"
     )
+    banner = _market_banner(keys)
+
     parts = [Text.from_markup(f"[bold {RED}]{LOGO}[/bold {RED}]"), "", banner, *panels, ""]
     if total > len(panels):
         shown_from = scroll + 1
@@ -387,7 +386,6 @@ def render(data, quotes, default, prev=None, scroll=0, total=None):
                 f"[dim]portfolios {shown_from}-{shown_to} of {total} — ↑/↓ to scroll[/dim]"
             )
         )
-    parts.append(keys)
     return Group(*parts)
 
 
