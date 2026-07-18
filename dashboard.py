@@ -920,19 +920,9 @@ def run_dashboard(console, args):
             prev = {}
             scroll = 0
             compact = False
+            quotes = {}  # last-known quotes; carried across cycles for an instant first paint
             while True:
                 data, symbols, default = snapshot(args.account)
-                quotes = fetch_quotes(symbols)
-                prices = {s: q[0] for s, q in quotes.items() if q}
-                today = datetime.now().strftime("%Y-%m-%d")
-                expired = any(
-                    pt.OCC_RE.match(sym) and pt.parse_occ(sym)[1] < today
-                    for *_, pos, _pend in data
-                    for sym, *_ in pos
-                )
-                if expired or any(pend for *_, pend in data):
-                    run_tick(prices)
-                    data, _, default = snapshot(args.account)
                 max_scroll = max(0, len(data) - PAGE_SIZE)
                 scroll = min(scroll, max_scroll)
 
@@ -948,6 +938,22 @@ def run_dashboard(console, args):
                             refresh=True,
                         )
 
+                # Paint immediately with last-known prices (blank '?' on the very
+                # first run) instead of leaving the screen empty while quotes
+                # fetch over the network — that blocking fetch is what made
+                # startup and periodic refreshes feel frozen.
+                redraw()
+                quotes = fetch_quotes(symbols)
+                prices = {s: q[0] for s, q in quotes.items() if q}
+                today = datetime.now().strftime("%Y-%m-%d")
+                expired = any(
+                    pt.OCC_RE.match(sym) and pt.parse_occ(sym)[1] < today
+                    for *_, pos, _pend in data
+                    for sym, *_ in pos
+                )
+                if expired or any(pend for *_, pend in data):
+                    run_tick(prices)
+                    data, _, default = snapshot(args.account)
                 redraw()
                 prev = prices or prev
                 deadline = time.monotonic() + args.interval
