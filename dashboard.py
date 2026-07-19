@@ -65,13 +65,18 @@ def snapshot(account_filter=None):
     return data, symbols, default
 
 
-def fetch_quotes(symbols):
+def fetch_quotes(symbols, executor=None):
     """{symbol: (last, prev_close) | None}. Options priced via chain (no prev_close).
 
     Option legs are grouped by (underlying, expiry) and each chain is downloaded
     once — a portfolio with several strikes on the same underlying/expiry (common
     with spreads, condors, butterflies) previously re-downloaded that whole chain
     once per leg, which dominated refresh time as position count grew.
+
+    Pass a shared `executor` (e.g. from run_dashboard's live loop) to reuse one
+    thread pool across refresh cycles instead of spawning and tearing down a
+    fresh batch of OS threads every cycle -- that churn is real CPU/RAM
+    overhead for a long-running background process, not just wasted work.
     """
     import yfinance as yf
 
@@ -108,14 +113,8 @@ def fetch_quotes(symbols):
                 out[sym] = None
         return out
 
-    task_count = len(stocks) + len(option_groups)
-    # This is network I/O bound (waiting on Yahoo Finance responses), not CPU
-    # bound, so one worker per request lets them all run concurrently instead
-    # of queuing behind a small fixed pool — capped to avoid opening an
-    # unreasonable number of connections if a portfolio gets huge.
-    max_workers = min(48, max(1, task_count))
-    quotes = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+    def run(ex):
+        quotes = {}
         futures = [ex.submit(get_stock, s) for s in stocks]
         futures += [
             ex.submit(get_option_group, root, expiry, legs)
@@ -123,7 +122,15 @@ def fetch_quotes(symbols):
         ]
         for fut in futures:
             quotes.update(fut.result())
-    return quotes
+        return quotes
+
+    if executor is not None:
+        return run(executor)
+    # No shared pool given (e.g. a one-shot call) -- size one to the task
+    # count same as before, capped well short of unbounded concurrency.
+    task_count = len(stocks) + len(option_groups)
+    with ThreadPoolExecutor(max_workers=min(16, max(1, task_count))) as ex:
+        return run(ex)
 
 
 def braille_chart(values, width=74, height=16):
@@ -947,7 +954,16 @@ def run_dashboard(console, args):
         tty_attrs = termios.tcgetattr(sys.stdin)
         tty.setcbreak(sys.stdin.fileno())
     try:
-        with Live(console=console, screen=True, auto_refresh=False) as live:
+        # One pool reused for the whole session instead of spawning/tearing
+        # down a fresh batch of OS threads every refresh cycle -- real CPU
+        # and memory churn for a background process that's meant to sit
+        # around all day. 16 concurrent requests is a deliberate balance:
+        # plenty of speedup over sequential fetching without holding open an
+        # unreasonable number of connections/threads at once.
+        with (
+            Live(console=console, screen=True, auto_refresh=False) as live,
+            ThreadPoolExecutor(max_workers=16) as pool,
+        ):
             prev = {}
             scroll = 0
             compact = False
@@ -974,7 +990,7 @@ def run_dashboard(console, args):
                 # fetch over the network — that blocking fetch is what made
                 # startup and periodic refreshes feel frozen.
                 redraw()
-                quotes = fetch_quotes(symbols)
+                quotes = fetch_quotes(symbols, executor=pool)
                 prices = {s: q[0] for s, q in quotes.items() if q}
                 today = datetime.now().strftime("%Y-%m-%d")
                 expired = any(

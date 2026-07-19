@@ -3426,8 +3426,10 @@ def _daily_closes(symbols, start, end):
     if len(ordered) < 2:
         return dict(fetch(symbol) for symbol in ordered)
     # Network I/O bound, not CPU bound -- see batch_prices() below for why
-    # this is sized to the task count instead of a small fixed pool.
-    with ThreadPoolExecutor(max_workers=min(48, len(ordered))) as executor:
+    # this is sized to the task count instead of a fixed small pool. Capped
+    # at 16, not unbounded, so a very large portfolio doesn't open dozens of
+    # concurrent connections/threads for one CLI call.
+    with ThreadPoolExecutor(max_workers=min(16, len(ordered))) as executor:
         return dict(executor.map(fetch, ordered))
 
 
@@ -3448,9 +3450,9 @@ def batch_prices(symbols, price_fn=None, ignore_errors=False):
         return dict(fetch(symbol) for symbol in ordered)
     # Network I/O bound (waiting on Yahoo Finance responses), not CPU bound,
     # so one worker per symbol lets them all run concurrently instead of
-    # queuing behind a small fixed pool — capped to avoid opening an
-    # unreasonable number of connections for a very large portfolio.
-    with ThreadPoolExecutor(max_workers=min(48, len(ordered))) as executor:
+    # queuing behind a small fixed pool — capped at 16, not unbounded, so a
+    # very large portfolio doesn't open dozens of concurrent connections.
+    with ThreadPoolExecutor(max_workers=min(16, len(ordered))) as executor:
         return dict(executor.map(fetch, ordered))
 
 

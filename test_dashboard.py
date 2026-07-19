@@ -283,7 +283,7 @@ saved = {
 try:
     dashboard.Live = lambda **_kwargs: DummyLive()
     dashboard.snapshot = lambda _account=None: ([], set(), None)
-    dashboard.fetch_quotes = lambda _symbols: {}
+    dashboard.fetch_quotes = lambda _symbols, executor=None: {}
     dashboard.render = lambda *_args, **_kwargs: "dashboard"
     dashboard.read_key = lambda _timeout: "q"
     assert (
