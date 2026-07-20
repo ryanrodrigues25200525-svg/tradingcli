@@ -225,7 +225,7 @@ def _refresh_market_status():
     threading.Thread(target=worker, daemon=True).start()
 
 
-def _market_banner(keys):
+def _market_banner(keys, refreshing=False):
     # pt.market_clock() first-call cost (~0.5-0.7s: lazy pandas + exchange_calendars
     # import and NYSE calendar construction) used to block the very first frame.
     # Market open/closed barely changes, so compute it off-thread and show a
@@ -242,6 +242,12 @@ def _market_banner(keys):
     if pt._yf_backoff_active():
         wait = max(0, round(pt._yf_rate_limited_until - time.monotonic()))
         extra = f"   [{RED}]⚠ Yahoo Finance rate limited — retrying in ~{wait}s[/{RED}]"
+    elif refreshing:
+        # Visible confirmation that r/t (or the periodic timer) actually
+        # kicked off a fetch -- without this, a keypress that lands while a
+        # fetch is already in flight is silently ignored (only one fetch
+        # runs at a time) and gives no feedback either way.
+        extra = "   [dim]⟳ refreshing quotes…[/dim]"
     status_line = Text.from_markup(f"{status}   [dim]as of {stamp}[/dim]{extra}")
     return Panel(Group(status_line, keys), border_style=RED)
 
@@ -265,7 +271,7 @@ def _account_totals(cash, deposits, realized, pos, quotes):
     return equity, day_sum, upnl_sum, total_pnl, ret_pct
 
 
-def render_compact(data, quotes, default):
+def render_compact(data, quotes, default, refreshing=False):
     t = Table(expand=True, pad_edge=False, border_style=GREY, header_style=f"bold {RED}")
     for col, justify in [
         ("PORTFOLIO", "left"),
@@ -311,12 +317,12 @@ def render_compact(data, quotes, default):
     return Group(
         Text.from_markup(f"[bold {RED}]{LOGO}[/bold {RED}]"),
         "",
-        _market_banner(keys),
+        _market_banner(keys, refreshing=refreshing),
         Panel(t, title="[bold]ALL PORTFOLIOS[/bold]", title_align="left", border_style=RED),
     )
 
 
-def render(data, quotes, default, prev=None, scroll=0, total=None):
+def render(data, quotes, default, prev=None, scroll=0, total=None, refreshing=False):
     prev = prev or {}
     total = len(data) if total is None else total
     panels = []
@@ -426,7 +432,7 @@ def render(data, quotes, default, prev=None, scroll=0, total=None):
         f"[{RED}]●[/{RED}]  [bold]↑/↓[/bold] Scroll  [{RED}]●[/{RED}]  [bold]t[/bold] Tick  [{RED}]●[/{RED}]  "
         f"[bold]r[/bold] Refresh  [{RED}]●[/{RED}]  [bold]q[/bold] Quit[/dim]"
     )
-    banner = _market_banner(keys)
+    banner = _market_banner(keys, refreshing=refreshing)
 
     parts = [Text.from_markup(f"[bold {RED}]{LOGO}[/bold {RED}]"), "", banner, *panels, ""]
     if total > len(panels):
@@ -981,17 +987,30 @@ def run_dashboard(console, args):
             compact = False
             prices = {}
             quotes = {}  # last-known quotes; carried across cycles for an instant first paint
+            pending = None  # set below; declared here so the first redraw() can read it
             data, symbols, default = snapshot(args.account)
 
             def redraw():
                 max_scroll = max(0, len(data) - PAGE_SIZE)
                 s = min(scroll, max_scroll)
+                refreshing = pending is not None
                 if compact:
-                    live.update(render_compact(data, quotes, default), refresh=True)
+                    live.update(
+                        render_compact(data, quotes, default, refreshing=refreshing),
+                        refresh=True,
+                    )
                 else:
                     visible = data[s : s + PAGE_SIZE]
                     live.update(
-                        render(visible, quotes, default, prev, scroll=s, total=len(data)),
+                        render(
+                            visible,
+                            quotes,
+                            default,
+                            prev,
+                            scroll=s,
+                            total=len(data),
+                            refreshing=refreshing,
+                        ),
                         refresh=True,
                     )
 
