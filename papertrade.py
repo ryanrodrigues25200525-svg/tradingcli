@@ -3475,10 +3475,106 @@ def _daily_closes(symbols, start, end):
         return dict(executor.map(fetch, ordered))
 
 
+def _grouped_option_prices(root, expiry, legs, ignore_errors):
+    """One option_chain() download priced across every leg on that
+    underlying/expiry, instead of option_price()'s one-download-per-leg.
+    Mirrors option_price()'s error handling exactly (same rate-limit
+    backoff, same clean SystemExit messages) since it's the same fetch,
+    just shared across legs that would otherwise each redo it."""
+    if _yf_backoff_active():
+        if ignore_errors:
+            return {sym: None for sym, _s, _c in legs}
+        raise _yf_rate_limit_error()
+    import yfinance as yf
+
+    tk = yf.Ticker(root)
+    try:
+        exps = list(tk.options)
+    except Exception as e:
+        _yf_note_error(e)
+        if ignore_errors:
+            return {sym: None for sym, _s, _c in legs}
+        if _yf_backoff_active():
+            raise _yf_rate_limit_error() from None
+        raise SystemExit(f"could not load options for {root}: {e}") from None
+    if expiry not in exps:
+        if ignore_errors:
+            return {sym: None for sym, _s, _c in legs}
+        raise SystemExit(
+            f"{root} has no {expiry} expiry — available: {', '.join(exps[:8])}"
+        )
+    try:
+        chain = tk.option_chain(expiry)
+    except Exception as e:
+        _yf_note_error(e)
+        if ignore_errors:
+            return {sym: None for sym, _s, _c in legs}
+        if _yf_backoff_active():
+            raise _yf_rate_limit_error() from None
+        raise SystemExit(f"could not load chain for {root} {expiry}: {e}") from None
+
+    out = {}
+    for sym, strike, cp in legs:
+        df = chain.calls if cp == "C" else chain.puts
+        rows = df[df.strike == strike]
+        if rows.empty:
+            if ignore_errors:
+                out[sym] = None
+                continue
+            raise SystemExit(f"no {strike:g} strike for {root} {expiry}")
+        r = rows.iloc[0]
+        bid, ask, last = float(r.bid), float(r.ask), float(r.lastPrice)
+        mid = (bid + ask) / 2 if bid > 0 and ask > 0 else last
+        if mid <= 0:
+            if ignore_errors:
+                out[sym] = None
+                continue
+            raise SystemExit(f"no tradeable price for {sym}")
+        out[sym] = mid
+    return out
+
+
 def batch_prices(symbols, price_fn=None, ignore_errors=False):
     """Fetch unique live marks concurrently while preserving input order."""
     ordered = list(dict.fromkeys(symbols))
     price_fn = price_fn or live_price
+
+    # Only the real default price_fn gets the chain-grouping fast path below
+    # -- a custom price_fn (heavily used by tests to mock prices without
+    # touching yfinance) must still be called once per symbol, unchanged.
+    if price_fn is live_price:
+        stocks, groups = [], {}
+        for s in ordered:
+            if OCC_RE.match(s):
+                root, expiry, strike, cp = parse_occ(s)
+                groups.setdefault((root, expiry), []).append((s, strike, cp))
+            else:
+                stocks.append(s)
+
+        def fetch_stock(s):
+            try:
+                return {s: live_price(s)}
+            except SystemExit:
+                if ignore_errors:
+                    return {s: None}
+                raise
+
+        tasks = [(fetch_stock, (s,)) for s in stocks]
+        tasks += [
+            (_grouped_option_prices, (root, expiry, legs, ignore_errors))
+            for (root, expiry), legs in groups.items()
+        ]
+        if len(tasks) < 2:
+            out = {}
+            for fn, fn_args in tasks:
+                out.update(fn(*fn_args))
+            return out
+        out = {}
+        with ThreadPoolExecutor(max_workers=min(16, len(tasks))) as executor:
+            futures = [executor.submit(fn, *fn_args) for fn, fn_args in tasks]
+            for fut in futures:
+                out.update(fut.result())  # re-raises on failure, same as before
+        return out
 
     def fetch(symbol):
         try:
