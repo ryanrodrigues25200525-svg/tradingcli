@@ -52,9 +52,8 @@ def account_create(
 @mcp.tool()
 def account_list() -> str:
     """List all paper accounts and their cash balances."""
-    conn = pt.db()
-    rows = conn.execute("SELECT name, cash FROM accounts").fetchall()
-    conn.close()
+    with pt.connection() as conn:
+        rows = conn.execute("SELECT name, cash FROM accounts").fetchall()
     return "\n".join(f"{n}: {c:,.2f}" for n, c in rows) or "no accounts"
 
 
@@ -111,12 +110,11 @@ def tick() -> str:
 @mcp.tool()
 def positions(account: str) -> str:
     """List open positions (symbol, side, qty, avg cost, asset class) for an account."""
-    conn = pt.db()
-    rows = conn.execute(
-        "SELECT symbol, qty, avg_cost, asset_class FROM positions WHERE account=?",
-        (account,),
-    ).fetchall()
-    conn.close()
+    with pt.connection() as conn:
+        rows = conn.execute(
+            "SELECT symbol, qty, avg_cost, asset_class FROM positions WHERE account=?",
+            (account,),
+        ).fetchall()
     return (
         "\n".join(
             f"{s}: {'long' if q > 0 else 'short'} {abs(q):g} @ {a:.2f} [{ac}]"
@@ -130,14 +128,13 @@ def positions(account: str) -> str:
 def orders(account: str, limit: int = 100, offset: int = 0) -> str:
     """List paginated order history, including source agent and idempotency key."""
     limit, offset = max(1, min(limit, 500)), max(0, offset)
-    conn = pt.db()
-    rows = conn.execute(
-        "SELECT id,ts,side,qty,symbol,order_type,limit_price,stop_price,time_in_force,"
-        "status,filled_price,source,request_id,client_order_id,parent_id,order_class,"
-        "reject_reason FROM orders WHERE account=? ORDER BY id DESC LIMIT ? OFFSET ?",
-        (account, limit, offset),
-    ).fetchall()
-    conn.close()
+    with pt.connection() as conn:
+        rows = conn.execute(
+            "SELECT id,ts,side,qty,symbol,order_type,limit_price,stop_price,time_in_force,"
+            "status,filled_price,source,request_id,client_order_id,parent_id,order_class,"
+            "reject_reason FROM orders WHERE account=? ORDER BY id DESC LIMIT ? OFFSET ?",
+            (account, limit, offset),
+        ).fetchall()
     out = []
     for (
         oid,
@@ -205,15 +202,14 @@ def rename_account(
 def summary() -> str:
     """One-line-per-portfolio snapshot for all accounts: cash, equity, unrealized P&L, position count.
     Fast overview for deciding which account to act on."""
-    conn = pt.db()
-    accounts = conn.execute(
-        "SELECT name,cash,deposits,realized FROM accounts ORDER BY name"
-    ).fetchall()
-    positions = conn.execute(
-        "SELECT account,symbol,qty,avg_cost,mult,asset_class,margin "
-        "FROM positions ORDER BY account,symbol"
-    ).fetchall()
-    conn.close()
+    with pt.connection() as conn:
+        accounts = conn.execute(
+            "SELECT name,cash,deposits,realized FROM accounts ORDER BY name"
+        ).fetchall()
+        positions = conn.execute(
+            "SELECT account,symbol,qty,avg_cost,mult,asset_class,margin "
+            "FROM positions ORDER BY account,symbol"
+        ).fetchall()
     positions_by_account: dict[str, list[tuple]] = {name: [] for name, *_ in accounts}
     for account, *position in positions:
         positions_by_account.setdefault(account, []).append(position)

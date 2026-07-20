@@ -218,6 +218,21 @@ def db():
 
 
 @contextlib.contextmanager
+def connection():
+    """`with pt.connection() as conn:` -- guarantees conn.close() even if a
+    query raises. A plain `conn = db(); ...; conn.close()` (used all over
+    dashboard.py and mcp_server.py) leaks the connection on any exception in
+    between; low-stakes for a one-off CLI call, real for dashboard.py's
+    snapshot(), which runs in a loop for a session that can stay open for
+    hours."""
+    conn = db()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+@contextlib.contextmanager
 def writing(conn):
     """Exclusive write transaction. BEGIN IMMEDIATE takes the write lock before any read,
     so concurrent agents can't lose updates in a read-modify-write."""

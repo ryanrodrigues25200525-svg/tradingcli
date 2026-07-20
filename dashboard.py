@@ -32,36 +32,37 @@ PAGE_SIZE = 3  # portfolio panels shown per screen in detail view; up/down scrol
 
 
 def snapshot(account_filter=None):
-    conn = pt.db()
-    if account_filter:
-        accounts = conn.execute(
-            "SELECT name,cash,deposits,realized FROM accounts WHERE name=?",
-            (account_filter,),
-        ).fetchall()
-    else:
-        accounts = conn.execute(
-            "SELECT name,cash,deposits,realized FROM accounts"
-        ).fetchall()
-    default = (
-        conn.execute("SELECT value FROM config WHERE key='default_account'").fetchone()
-        or [None]
-    )[0]
-    data, symbols = [], set()
-    for name, cash, dep, real in accounts:
-        pos = conn.execute(
-            "SELECT symbol, qty, avg_cost, mult, asset_class, margin"
-            " FROM positions WHERE account=?",
-            (name,),
-        ).fetchall()
-        pend = conn.execute(
-            "SELECT id,side,qty,symbol,order_type,limit_price,stop_price,"
-            "trail_price,trail_percent,time_in_force FROM orders"
-            " WHERE account=? AND status='pending'",
-            (name,),
-        ).fetchall()
-        symbols |= {s for s, *_ in pos} | {order[3] for order in pend}
-        data.append((name, cash, dep, real, pos, pend))
-    conn.close()
+    with pt.connection() as conn:
+        if account_filter:
+            accounts = conn.execute(
+                "SELECT name,cash,deposits,realized FROM accounts WHERE name=?",
+                (account_filter,),
+            ).fetchall()
+        else:
+            accounts = conn.execute(
+                "SELECT name,cash,deposits,realized FROM accounts"
+            ).fetchall()
+        default = (
+            conn.execute(
+                "SELECT value FROM config WHERE key='default_account'"
+            ).fetchone()
+            or [None]
+        )[0]
+        data, symbols = [], set()
+        for name, cash, dep, real in accounts:
+            pos = conn.execute(
+                "SELECT symbol, qty, avg_cost, mult, asset_class, margin"
+                " FROM positions WHERE account=?",
+                (name,),
+            ).fetchall()
+            pend = conn.execute(
+                "SELECT id,side,qty,symbol,order_type,limit_price,stop_price,"
+                "trail_price,trail_percent,time_in_force FROM orders"
+                " WHERE account=? AND status='pending'",
+                (name,),
+            ).fetchall()
+            symbols |= {s for s, *_ in pos} | {order[3] for order in pend}
+            data.append((name, cash, dep, real, pos, pend))
     return data, symbols, default
 
 
@@ -592,12 +593,13 @@ def first_run_setup(console):
 
 
 def prompt_order(console, side):
-    conn = pt.db()
-    default = (
-        conn.execute("SELECT value FROM config WHERE key='default_account'").fetchone()
-        or [None]
-    )[0]
-    conn.close()
+    with pt.connection() as conn:
+        default = (
+            conn.execute(
+                "SELECT value FROM config WHERE key='default_account'"
+            ).fetchone()
+            or [None]
+        )[0]
     console.print(
         f"\n[bold {RED}]▚ {side.capitalize()} order[/bold {RED}] "
         f"[dim](stock/ETF/crypto e.g. AAPL, BTC-USD · future e.g. ES=F)[/dim]"
@@ -627,12 +629,13 @@ def prompt_order(console, side):
 
 
 def prompt_option(console):
-    conn = pt.db()
-    default = (
-        conn.execute("SELECT value FROM config WHERE key='default_account'").fetchone()
-        or [None]
-    )[0]
-    conn.close()
+    with pt.connection() as conn:
+        default = (
+            conn.execute(
+                "SELECT value FROM config WHERE key='default_account'"
+            ).fetchone()
+            or [None]
+        )[0]
     console.print(
         f"\n[bold {RED}]▚ Option order[/bold {RED}] "
         f"[dim](run `tradingcli chain SYMBOL` to find expiries/strikes)[/dim]"
@@ -675,9 +678,8 @@ def prompt_option(console):
 
 
 def prompt_rename(console):
-    conn = pt.db()
-    names = [n for (n,) in conn.execute("SELECT name FROM accounts")]
-    conn.close()
+    with pt.connection() as conn:
+        names = [n for (n,) in conn.execute("SELECT name FROM accounts")]
     console.print(
         f"\n[bold {RED}]▚ Rename portfolio[/bold {RED}]  [dim]{', '.join(names)}[/dim]"
     )
@@ -845,13 +847,14 @@ def backtesting_graphs_view(account, current_curve, backtest, current_metrics=No
 
 
 def prompt_backtesting_graphs(console, account_filter):
-    conn = pt.db()
-    names = [n for (n,) in conn.execute("SELECT name FROM accounts")]
-    default = (
-        conn.execute("SELECT value FROM config WHERE key='default_account'").fetchone()
-        or [None]
-    )[0]
-    conn.close()
+    with pt.connection() as conn:
+        names = [n for (n,) in conn.execute("SELECT name FROM accounts")]
+        default = (
+            conn.execute(
+                "SELECT value FROM config WHERE key='default_account'"
+            ).fetchone()
+            or [None]
+        )[0]
     if not names:
         return
     console.print(
@@ -936,9 +939,8 @@ def prompt_cancel(console):
 
 
 def prompt_use(console):
-    conn = pt.db()
-    names = [n for (n,) in conn.execute("SELECT name FROM accounts")]
-    conn.close()
+    with pt.connection() as conn:
+        names = [n for (n,) in conn.execute("SELECT name FROM accounts")]
     console.print(
         f"\n[bold {RED}]▚ Switch default[/bold {RED}]  [dim]{', '.join(names)}[/dim]"
     )
@@ -998,7 +1000,7 @@ def run_dashboard(console, args):
                 worker, so it can freely use `pool` for its own sub-tasks
                 without a self-submission wait) and return a mutable holder
                 the main loop polls without ever blocking on it."""
-                holder = {"done": False, "quotes": None}
+                holder = {"done": False, "quotes": None, "started_at": time.monotonic()}
 
                 def worker():
                     try:
@@ -1028,6 +1030,21 @@ def run_dashboard(console, args):
                 # same blocking structure would feel identical in any
                 # language, so this is fixed here rather than by a rewrite.
                 key = read_key(0.15)
+
+                # yfinance/requests sets no default socket timeout, so a
+                # genuinely stalled connection (not a clean error -- those
+                # are already caught inside fetch_quotes) could otherwise
+                # leave `pending` stuck forever: never done, so neither the
+                # auto-refresh check nor a manual t/r press could ever fire
+                # again for the rest of the session. Treat a fetch that's
+                # been running unreasonably long (real ones take 1-5s) as
+                # abandoned instead. The thread itself is daemon and keeps
+                # running in the background until/if it ever finishes, but
+                # its result is just discarded -- the UI recovers either way.
+                if pending is not None and not pending["done"]:
+                    if time.monotonic() - pending["started_at"] > 45.0:
+                        pending = None
+                        next_refresh_at = time.monotonic()
 
                 if pending is not None and pending["done"]:
                     quotes = pending["quotes"]
@@ -1097,10 +1114,9 @@ def main():
     args = ap.parse_args()
 
     console = Console()
-    conn = pt.db()
-    done = conn.execute("SELECT 1 FROM config WHERE key='setup_done'").fetchone()
-    empty = conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 0
-    conn.close()
+    with pt.connection() as conn:
+        done = conn.execute("SELECT 1 FROM config WHERE key='setup_done'").fetchone()
+        empty = conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 0
     if not done and empty and sys.stdin.isatty():
         first_run_setup(console)  # one-time onboarding
 
