@@ -3990,7 +3990,9 @@ def _build_parser():
     export.add_argument("--limit", type=int, default=5000)
     sub.add_parser("backup")
     sub.add_parser("doctor")
-    sub.add_parser("dash")
+    dash = sub.add_parser("dash")
+    dash.add_argument("-a", "--account")
+    dash.add_argument("-n", "--interval", type=float)
     sub.add_parser("cancel").add_argument("order_id", type=int)
     remove = sub.add_parser("rm")
     remove.add_argument("name")
@@ -4081,7 +4083,12 @@ def _run_cli(args):
         script = os.path.join(
             os.path.dirname(os.path.realpath(__file__)), "dashboard.py"
         )
-        os.execv(sys.executable, [sys.executable, script])
+        dash_argv = [sys.executable, script]
+        if args.account:
+            dash_argv += ["-a", args.account]
+        if args.interval is not None:
+            dash_argv += ["-n", str(args.interval)]
+        os.execv(sys.executable, dash_argv)
     if args.cmd == "chain":
         show_chain(args.underlying, args.expiry)
         return

@@ -1086,7 +1086,14 @@ def run_dashboard(console, args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-a", "--account")
-    ap.add_argument("-n", "--interval", type=float, default=2.0)
+    ap.add_argument(
+        "-n",
+        "--interval",
+        type=float,
+        default=300.0,
+        help="seconds between automatic price refreshes (default 300 = 5min; "
+        "press t/r for an on-demand refresh any time)",
+    )
     args = ap.parse_args()
 
     console = Console()
