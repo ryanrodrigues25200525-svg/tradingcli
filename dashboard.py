@@ -225,7 +225,13 @@ def _refresh_market_status():
     threading.Thread(target=worker, daemon=True).start()
 
 
-def _market_banner(keys, refreshing=False):
+def _format_countdown(seconds):
+    seconds = max(0, round(seconds))
+    m, s = divmod(seconds, 60)
+    return f"{m}:{s:02d}" if m else f"{s}s"
+
+
+def _market_banner(keys, refreshing=False, next_refresh_at=None):
     # pt.market_clock() first-call cost (~0.5-0.7s: lazy pandas + exchange_calendars
     # import and NYSE calendar construction) used to block the very first frame.
     # Market open/closed barely changes, so compute it off-thread and show a
@@ -248,6 +254,8 @@ def _market_banner(keys, refreshing=False):
         # fetch is already in flight is silently ignored (only one fetch
         # runs at a time) and gives no feedback either way.
         extra = "   [dim]⟳ refreshing quotes…[/dim]"
+    elif next_refresh_at is not None:
+        extra = f"   [dim]next refresh in {_format_countdown(next_refresh_at - time.monotonic())}[/dim]"
     status_line = Text.from_markup(f"{status}   [dim]as of {stamp}[/dim]{extra}")
     return Panel(Group(status_line, keys), border_style=RED)
 
@@ -271,7 +279,7 @@ def _account_totals(cash, deposits, realized, pos, quotes):
     return equity, day_sum, upnl_sum, total_pnl, ret_pct
 
 
-def render_compact(data, quotes, default, refreshing=False):
+def render_compact(data, quotes, default, refreshing=False, next_refresh_at=None):
     t = Table(expand=True, pad_edge=False, border_style=GREY, header_style=f"bold {RED}")
     for col, justify in [
         ("PORTFOLIO", "left"),
@@ -317,12 +325,21 @@ def render_compact(data, quotes, default, refreshing=False):
     return Group(
         Text.from_markup(f"[bold {RED}]{LOGO}[/bold {RED}]"),
         "",
-        _market_banner(keys, refreshing=refreshing),
+        _market_banner(keys, refreshing=refreshing, next_refresh_at=next_refresh_at),
         Panel(t, title="[bold]ALL PORTFOLIOS[/bold]", title_align="left", border_style=RED),
     )
 
 
-def render(data, quotes, default, prev=None, scroll=0, total=None, refreshing=False):
+def render(
+    data,
+    quotes,
+    default,
+    prev=None,
+    scroll=0,
+    total=None,
+    refreshing=False,
+    next_refresh_at=None,
+):
     prev = prev or {}
     total = len(data) if total is None else total
     panels = []
@@ -432,7 +449,7 @@ def render(data, quotes, default, prev=None, scroll=0, total=None, refreshing=Fa
         f"[{RED}]●[/{RED}]  [bold]↑/↓[/bold] Scroll  [{RED}]●[/{RED}]  [bold]t[/bold] Tick  [{RED}]●[/{RED}]  "
         f"[bold]r[/bold] Refresh  [{RED}]●[/{RED}]  [bold]q[/bold] Quit[/dim]"
     )
-    banner = _market_banner(keys, refreshing=refreshing)
+    banner = _market_banner(keys, refreshing=refreshing, next_refresh_at=next_refresh_at)
 
     parts = [Text.from_markup(f"[bold {RED}]{LOGO}[/bold {RED}]"), "", banner, *panels, ""]
     if total > len(panels):
@@ -988,6 +1005,7 @@ def run_dashboard(console, args):
             prices = {}
             quotes = {}  # last-known quotes; carried across cycles for an instant first paint
             pending = None  # set below; declared here so the first redraw() can read it
+            next_refresh_at = None  # ditto -- set once the first fetch lands
             data, symbols, default = snapshot(args.account)
 
             def redraw():
@@ -996,7 +1014,13 @@ def run_dashboard(console, args):
                 refreshing = pending is not None
                 if compact:
                     live.update(
-                        render_compact(data, quotes, default, refreshing=refreshing),
+                        render_compact(
+                            data,
+                            quotes,
+                            default,
+                            refreshing=refreshing,
+                            next_refresh_at=next_refresh_at,
+                        ),
                         refresh=True,
                     )
                 else:
@@ -1010,6 +1034,7 @@ def run_dashboard(console, args):
                             scroll=s,
                             total=len(data),
                             refreshing=refreshing,
+                            next_refresh_at=next_refresh_at,
                         ),
                         refresh=True,
                     )
@@ -1036,7 +1061,7 @@ def run_dashboard(console, args):
             # fetch over the network.
             redraw()
             pending = start_fetch(symbols)
-            next_refresh_at = None  # set once the in-flight fetch lands
+            last_tick_redraw = time.monotonic()
 
             while True:
                 # A short, constant poll — never the multi-second wait a
@@ -1084,6 +1109,15 @@ def run_dashboard(console, args):
 
                 if pending is None and time.monotonic() >= next_refresh_at:
                     pending = start_fetch(symbols)
+
+                # Keep the "next refresh in Ns" countdown actually ticking
+                # even when nothing else changed -- every other redraw() call
+                # above only fires on a real state change (fetch landed, key
+                # pressed), which would otherwise leave the displayed number
+                # stale between those events.
+                if next_refresh_at is not None and time.monotonic() - last_tick_redraw >= 1.0:
+                    last_tick_redraw = time.monotonic()
+                    redraw()
 
                 if key is None:
                     continue
