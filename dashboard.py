@@ -89,17 +89,23 @@ def fetch_quotes(symbols, executor=None):
             stocks.append(s)
 
     def get_stock(s):
+        if pt._yf_backoff_active():
+            return {s: None}
         try:
             fi = yf.Ticker(s).fast_info
             pc = fi.get("previousClose")
             return {s: (float(fi["lastPrice"]), float(pc) if pc else None)}
-        except Exception:
+        except Exception as e:
+            pt._yf_note_error(e)
             return {s: None}  # render as '?', retry next cycle
 
     def get_option_group(root, expiry, legs):
+        if pt._yf_backoff_active():
+            return {sym: None for sym, _strike, _cp in legs}
         try:
             chain = yf.Ticker(root).option_chain(expiry)
-        except Exception:
+        except Exception as e:
+            pt._yf_note_error(e)
             return {sym: None for sym, _strike, _cp in legs}
         out = {}
         for sym, strike, cp in legs:
@@ -231,7 +237,11 @@ def _market_banner(keys):
         _refresh_market_status()
     status = line or "[dim]●  checking market status…[/dim]"
     stamp = datetime.now().strftime("%H:%M:%S")
-    status_line = Text.from_markup(f"{status}   [dim]as of {stamp}[/dim]")
+    extra = ""
+    if pt._yf_backoff_active():
+        wait = max(0, round(pt._yf_rate_limited_until - time.monotonic()))
+        extra = f"   [{RED}]⚠ Yahoo Finance rate limited — retrying in ~{wait}s[/{RED}]"
+    status_line = Text.from_markup(f"{status}   [dim]as of {stamp}[/dim]{extra}")
     return Panel(Group(status_line, keys), border_style=RED)
 
 

@@ -21,6 +21,7 @@ import re
 import sqlite3
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -404,17 +405,53 @@ def build_occ(root, expiry, strike, cp):
     return f"{root}{expiry_date:%y%m%d}{cp}{int(round(strike * 1000)):08d}"
 
 
+_yf_rate_limited_until = 0.0  # monotonic timestamp; back off network calls until past this
+
+
+def _yf_backoff_active():
+    return time.monotonic() < _yf_rate_limited_until
+
+
+def _yf_note_error(exc):
+    """Track Yahoo Finance rate limiting so repeated calls back off instead of
+    continuing to hammer an already-limited endpoint, which only extends the
+    block. Matched by class name (not isinstance) so this works whether or
+    not the caller imported yfinance.exceptions."""
+    global _yf_rate_limited_until
+    if type(exc).__name__ == "YFRateLimitError":
+        _yf_rate_limited_until = time.monotonic() + 30.0
+
+
+def _yf_rate_limit_error():
+    wait = max(0, round(_yf_rate_limited_until - time.monotonic()))
+    return SystemExit(f"Yahoo Finance is rate limiting requests — try again in ~{wait}s")
+
+
 def option_price(occ):
     root, expiry, strike, cp = parse_occ(occ)
+    if _yf_backoff_active():
+        raise _yf_rate_limit_error()
     import yfinance as yf
 
     tk = yf.Ticker(root)
-    exps = list(tk.options)
+    try:
+        exps = list(tk.options)
+    except Exception as e:
+        _yf_note_error(e)
+        if _yf_backoff_active():
+            raise _yf_rate_limit_error() from None
+        raise SystemExit(f"could not load options for {root}: {e}") from None
     if expiry not in exps:
         raise SystemExit(
             f"{root} has no {expiry} expiry — available: {', '.join(exps[:8])}"
         )
-    df = tk.option_chain(expiry)
+    try:
+        df = tk.option_chain(expiry)
+    except Exception as e:
+        _yf_note_error(e)
+        if _yf_backoff_active():
+            raise _yf_rate_limit_error() from None
+        raise SystemExit(f"could not load chain for {root} {expiry}: {e}") from None
     df = df.calls if cp == "C" else df.puts
     rows = df[df.strike == strike]
     if rows.empty:
@@ -439,11 +476,16 @@ def live_price(symbol):
     _quiet_yf()
     if OCC_RE.match(symbol):
         return option_price(symbol)
+    if _yf_backoff_active():
+        raise _yf_rate_limit_error()
     import yfinance as yf
 
     try:
         p = yf.Ticker(symbol).fast_info["lastPrice"]
-    except Exception:
+    except Exception as e:
+        _yf_note_error(e)
+        if _yf_backoff_active():
+            raise _yf_rate_limit_error() from None
         p = None
     if not p or p <= 0:
         raise SystemExit(f"no price for {symbol} (unknown or delisted symbol?)")
