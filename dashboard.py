@@ -1160,8 +1160,8 @@ def main():
         "-n",
         "--interval",
         type=float,
-        default=300.0,
-        help="seconds between automatic price refreshes (default 300 = 5min; "
+        default=900.0,
+        help="seconds between automatic price refreshes (default 900 = 15min; "
         "press t/r for an on-demand refresh any time)",
     )
     args = ap.parse_args()
