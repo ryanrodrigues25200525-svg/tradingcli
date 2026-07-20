@@ -967,75 +967,107 @@ def run_dashboard(console, args):
             prev = {}
             scroll = 0
             compact = False
+            prices = {}
             quotes = {}  # last-known quotes; carried across cycles for an instant first paint
-            while True:
-                data, symbols, default = snapshot(args.account)
+            data, symbols, default = snapshot(args.account)
+
+            def redraw():
                 max_scroll = max(0, len(data) - PAGE_SIZE)
-                scroll = min(scroll, max_scroll)
+                s = min(scroll, max_scroll)
+                if compact:
+                    live.update(render_compact(data, quotes, default), refresh=True)
+                else:
+                    visible = data[s : s + PAGE_SIZE]
+                    live.update(
+                        render(visible, quotes, default, prev, scroll=s, total=len(data)),
+                        refresh=True,
+                    )
 
-                def redraw():
-                    if compact:
-                        live.update(render_compact(data, quotes, default), refresh=True)
-                    else:
-                        visible = data[scroll : scroll + PAGE_SIZE]
-                        live.update(
-                            render(
-                                visible, quotes, default, prev, scroll=scroll, total=len(data)
-                            ),
-                            refresh=True,
-                        )
+            def start_fetch(syms):
+                """Run fetch_quotes on a plain background thread (not a pool
+                worker, so it can freely use `pool` for its own sub-tasks
+                without a self-submission wait) and return a mutable holder
+                the main loop polls without ever blocking on it."""
+                holder = {"done": False, "quotes": None}
 
-                # Paint immediately with last-known prices (blank '?' on the very
-                # first run) instead of leaving the screen empty while quotes
-                # fetch over the network — that blocking fetch is what made
-                # startup and periodic refreshes feel frozen.
-                redraw()
-                quotes = fetch_quotes(symbols, executor=pool)
-                prices = {s: q[0] for s, q in quotes.items() if q}
-                today = datetime.now().strftime("%Y-%m-%d")
-                expired = any(
-                    pt.OCC_RE.match(sym) and pt.parse_occ(sym)[1] < today
-                    for *_, pos, _pend in data
-                    for sym, *_ in pos
-                )
-                if expired or any(pend for *_, pend in data):
-                    run_tick(prices)
-                    data, _, default = snapshot(args.account)
-                redraw()
-                prev = prices or prev
-                deadline = time.monotonic() + args.interval
-                while (left := deadline - time.monotonic()) > 0:
-                    key = read_key(min(left, 0.25))
-                    if key == "q":
-                        return "quit"
-                    if key in ("n", "u", "b", "s", "c", "o", "g", "e"):
-                        return {
-                            "n": "new",
-                            "u": "use",
-                            "b": "buy",
-                            "s": "sell",
-                            "c": "cancel",
-                            "o": "option",
-                            "g": "backtesting_graphs",
-                            "e": "rename",
-                        }[key]
-                    if key == "v":
-                        compact = not compact
-                        redraw()
-                        continue
-                    if key == "DOWN" and not compact:
-                        scroll = min(scroll + 1, max_scroll)
-                        redraw()
-                        continue
-                    if key == "UP" and not compact:
-                        scroll = max(scroll - 1, 0)
-                        redraw()
-                        continue
+                def worker():
+                    try:
+                        holder["quotes"] = fetch_quotes(syms, executor=pool)
+                    except Exception:
+                        holder["quotes"] = {}
+                    holder["done"] = True
+
+                threading.Thread(target=worker, daemon=True).start()
+                return holder
+
+            # Paint immediately with last-known prices (blank '?' on the very
+            # first run) instead of leaving the screen empty while quotes
+            # fetch over the network.
+            redraw()
+            pending = start_fetch(symbols)
+            next_refresh_at = None  # set once the in-flight fetch lands
+
+            while True:
+                # A short, constant poll — never the multi-second wait a
+                # blocking fetch used to impose — so keys are always read
+                # promptly, including while a refresh is in flight in the
+                # background. This is the actual fix for "sometimes doesn't
+                # respond": the old loop simply wasn't reading input for the
+                # 1-2s a fetch was running, every single refresh cycle. That
+                # dead zone was a control-flow bug, not a raw-speed one — the
+                # same blocking structure would feel identical in any
+                # language, so this is fixed here rather than by a rewrite.
+                key = read_key(0.15)
+
+                if pending is not None and pending["done"]:
+                    quotes = pending["quotes"]
+                    prices = {s: q[0] for s, q in quotes.items() if q}
+                    today = datetime.now().strftime("%Y-%m-%d")
+                    expired = any(
+                        pt.OCC_RE.match(sym) and pt.parse_occ(sym)[1] < today
+                        for *_, pos, _pend in data
+                        for sym, *_ in pos
+                    )
+                    if expired or any(pend for *_, pend in data):
+                        run_tick(prices)
+                        data, symbols, default = snapshot(args.account)
+                    prev = prices or prev
+                    pending = None
+                    next_refresh_at = time.monotonic() + args.interval
+                    redraw()
+
+                if pending is None and time.monotonic() >= next_refresh_at:
+                    pending = start_fetch(symbols)
+
+                if key is None:
+                    continue
+                if key == "q":
+                    return "quit"
+                if key in ("n", "u", "b", "s", "c", "o", "g", "e"):
+                    return {
+                        "n": "new",
+                        "u": "use",
+                        "b": "buy",
+                        "s": "sell",
+                        "c": "cancel",
+                        "o": "option",
+                        "g": "backtesting_graphs",
+                        "e": "rename",
+                    }[key]
+                if key == "v":
+                    compact = not compact
+                    redraw()
+                elif key == "DOWN" and not compact:
+                    max_scroll = max(0, len(data) - PAGE_SIZE)
+                    scroll = min(scroll + 1, max_scroll)
+                    redraw()
+                elif key == "UP" and not compact:
+                    scroll = max(scroll - 1, 0)
+                    redraw()
+                elif key in ("t", "r") and pending is None:
                     if key == "t":
                         run_tick(prices)
-                        break
-                    if key == "r":
-                        break
+                    pending = start_fetch(symbols)
     finally:
         if tty_attrs:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, tty_attrs)
