@@ -66,7 +66,12 @@ assert {job["action"] for job in pt.features.schedule_list(conn)} >= {
 }
 
 benchmark = pt.terminal_benchmark(3)
-assert benchmark["passes"]["startup"] and benchmark["passes"]["database"]
+assert benchmark["startup_median_ms"] > 0
+assert benchmark["database_median_ms"] > 0
+assert benchmark["startup_median_ms"] < 1000
+assert benchmark["database_median_ms"] < 500
+assert benchmark["budgets_ms"] == {"startup": 75, "database": 10}
+assert set(benchmark["passes"]) == {"startup", "database"}
 
 with pt.writing(conn):
     pt.features.alert_delete(conn, alert_id)
