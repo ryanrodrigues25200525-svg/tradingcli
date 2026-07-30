@@ -20,9 +20,7 @@ import os
 import re
 import sqlite3
 import sys
-import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from functools import lru_cache
@@ -30,7 +28,7 @@ from functools import lru_cache
 import tradingcli_features as features
 
 DB = os.environ.get("PAPERTRADE_DB", os.path.expanduser("~/.papertrade.db"))
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 MARKET_DATA_TIMEOUT = max(
     1.0, float(os.environ.get("PAPERTRADE_MARKET_TIMEOUT", "15"))
 )
@@ -63,6 +61,7 @@ FUTURES = {
 
 OCC_RE = re.compile(r"^([A-Z]{1,6})(\d{2})(\d{2})(\d{2})([CP])(\d{8})$")
 SCHEMA_VERSION = 5
+EXPECTED_DATA_GUARDS = 54
 MONEY_QUANTUM = Decimal("0.01")
 PRICE_QUANTUM = Decimal("0.000001")
 QUANTITY_QUANTUM = Decimal("0.00000001")
@@ -731,13 +730,18 @@ def _secure_database_files(path):
         return
     for candidate in (path, f"{path}-wal", f"{path}-shm"):
         try:
-            os.chmod(candidate, 0o600)
+            # chmod dirties filesystem metadata. Most calls are already
+            # private, so avoid six redundant chmod syscalls per command.
+            if os.stat(candidate).st_mode & 0o777 != 0o600:
+                os.chmod(candidate, 0o600)
         except FileNotFoundError:
             continue
 
 
 def _migration_backup(conn, path, from_version):
     """Create a private, consistent backup before changing an existing schema."""
+    import tempfile
+
     directory = f"{path}.migrations"
     os.makedirs(directory, mode=0o700, exist_ok=True)
     os.chmod(directory, 0o700)
@@ -788,7 +792,9 @@ def db():
         backup_path = None
         if current_version < SCHEMA_VERSION and had_schema and path is not None:
             backup_path = _migration_backup(conn, path, current_version)
-        conn.executescript(SCHEMA)
+        schema_needs_install = current_version < SCHEMA_VERSION or not had_schema
+        if schema_needs_install:
+            conn.executescript(SCHEMA)
         if current_version < SCHEMA_VERSION:
             with writing(conn):
                 # Another process may have completed this while we waited for the lock.
@@ -800,8 +806,13 @@ def db():
                             ("last_migration_backup", backup_path),
                         )
                     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-        _install_data_guards(conn)
-        features.install_guards(conn)
+        # Schema and guards are immutable for a given schema version. Replaying
+        # dozens of CREATE TABLE/TRIGGER statements on every invocation adds
+        # latency and lock pressure without improving safety. `doctor` still
+        # verifies their presence and migrations reinstall them when required.
+        if schema_needs_install:
+            _install_data_guards(conn)
+            features.install_guards(conn)
         return conn
     except BaseException:
         conn.close()
@@ -1169,9 +1180,9 @@ def _yahoo_live_price(symbol):
 
 def live_price(symbol):
     symbol = symbol.upper()
-    ttl = max(0.0, float(os.environ.get("PAPERTRADE_PRICE_CACHE_TTL", "5")))
+    ttl = max(0.0, float(os.environ.get("PAPERTRADE_PRICE_CACHE_TTL", "15")))
     return features.provider_price(
-        symbol, lambda: _yahoo_live_price(symbol), ttl=ttl
+        symbol, lambda: _yahoo_live_price(symbol), ttl=ttl, database=DB
     )
 
 
@@ -4041,17 +4052,20 @@ def market_history(
     return {"symbol": symbol, "kind": kind, "timeframe": timeframe, "data": rows}
 
 
-def latest_quote(symbol):
+def latest_quote(symbol, detailed=True):
     symbol = symbol.strip().upper()
-    _quiet_yf()
-    import yfinance as yf
-
-    ticker = yf.Ticker(symbol)
-    try:
-        info = ticker.info or {}
-    except Exception:
-        info = {}
     price = live_price(symbol)
+    info = {}
+    if detailed:
+        # `.info` is a second, comparatively expensive Yahoo request. Commands
+        # that only need a current mark use the fast indicative path.
+        _quiet_yf()
+        import yfinance as yf
+
+        try:
+            info = yf.Ticker(symbol).info or {}
+        except Exception:
+            info = {}
     bid, ask = _number(info.get("bid")), _number(info.get("ask"))
     return {
         "symbol": symbol,
@@ -4064,7 +4078,7 @@ def latest_quote(symbol):
 
 
 def latest_trade(symbol):
-    quote = latest_quote(symbol)
+    quote = latest_quote(symbol, detailed=False)
     return {
         "symbol": quote["symbol"],
         "price": quote["last"],
@@ -4074,7 +4088,7 @@ def latest_trade(symbol):
 
 def market_snapshot(symbol):
     history = market_history(symbol, "bars", timeframe="1Day", limit=2)["data"]
-    quote = latest_quote(symbol)
+    quote = latest_quote(symbol, detailed=False)
     previous = history[-2]["close"] if len(history) > 1 else None
     change = quote["last"] - previous if previous else None
     return {
@@ -4286,6 +4300,8 @@ def account_activities(
 
 
 def backup_database(conn, directory=None):
+    import tempfile
+
     directory = directory or os.path.expanduser("~/.papertrade_backups")
     os.makedirs(directory, mode=0o700, exist_ok=True)
     os.chmod(directory, 0o700)
@@ -4330,7 +4346,7 @@ def healthcheck(conn):
         and schema_version == SCHEMA_VERSION
         and logical["total"] == 0
         and bool(foreign_keys)
-        and guard_count > 0
+        and guard_count >= EXPECTED_DATA_GUARDS
         and feature_status["valid"]
     )
     return {
@@ -4339,6 +4355,7 @@ def healthcheck(conn):
         "logical_integrity": logical,
         "foreign_keys": bool(foreign_keys),
         "data_guards": guard_count,
+        "expected_data_guards": EXPECTED_DATA_GUARDS,
         "fixed_precision": {"money": 2, "price": 6, "quantity": 8},
         "features": feature_status,
         "journal_mode": conn.execute("PRAGMA journal_mode").fetchone()[0],
@@ -4391,6 +4408,8 @@ def pnl(conn, account, price_fn=live_price):
 
 
 def _daily_closes(symbols, start, end):
+    from concurrent.futures import ThreadPoolExecutor
+
     """{symbol: {YYYY-MM-DD: close}}. Options have no reliable history -> empty (marked flat)."""
     _quiet_yf()
     import yfinance as yf
@@ -4489,6 +4508,8 @@ def _grouped_option_prices(root, expiry, legs, ignore_errors):
 
 
 def batch_prices(symbols, price_fn=None, ignore_errors=False):
+    from concurrent.futures import ThreadPoolExecutor
+
     """Fetch unique live marks concurrently while preserving input order."""
     ordered = list(dict.fromkeys(symbols))
     price_fn = price_fn or live_price
@@ -5266,7 +5287,7 @@ def _run_cli(args):
         elif args.cmd == "validate":
             result = validate_asset(args.symbol)
         elif args.cmd == "quote":
-            result = latest_quote(args.symbol)
+            result = latest_quote(args.symbol, detailed=False)
         elif args.cmd == "market":
             result = market_clock()
         elif args.cmd == "calendar":
@@ -5293,7 +5314,7 @@ def _run_cli(args):
             ]
             result = rows[-1] if rows else None
         elif args.data_cmd == "latest-quote":
-            result = latest_quote(args.symbol)
+            result = latest_quote(args.symbol, detailed=False)
         elif args.data_cmd == "latest-trade":
             result = latest_trade(args.symbol)
         elif args.data_cmd == "snapshot":
@@ -5313,7 +5334,7 @@ def _run_cli(args):
             pair = args.pair.upper().replace("/", "")
             if len(pair) != 6:
                 raise SystemExit("forex pair must look like USD/EUR")
-            result = latest_quote(f"{pair}=X")
+            result = latest_quote(f"{pair}=X", detailed=False)
         print(json.dumps(result, indent=2))
         return
     if args.cmd == "serve":

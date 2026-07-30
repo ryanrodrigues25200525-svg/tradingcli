@@ -98,6 +98,30 @@ variance = sum((value - mean) ** 2 for value in returns) / (len(returns) - 1)
 expected_volatility = math.sqrt(variance) * math.sqrt(365)
 assert abs(calendar_metrics["vol"] - expected_volatility) < 1e-12
 
+# A second CLI process should reuse a recent price instead of repeating a
+# network request. Clearing the memory cache simulates a fresh process.
+provider_calls = 0
+
+
+def counted_price():
+    global provider_calls
+    provider_calls += 1
+    return 123.45
+
+
+pt.features._price_cache.clear()
+assert pt.features.provider_price(
+    "CACHE-SPEED", counted_price, ttl=30, database=os.environ["PAPERTRADE_DB"]
+) == 123.45
+pt.features._price_cache.clear()
+assert pt.features.provider_price(
+    "CACHE-SPEED",
+    lambda: (_ for _ in ()).throw(AssertionError("cache miss")),
+    ttl=30,
+    database=os.environ["PAPERTRADE_DB"],
+) == 123.45
+assert provider_calls == 1
+
 conn.close()
 print(
     "performance checks passed "

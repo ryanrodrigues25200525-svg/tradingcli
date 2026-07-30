@@ -2,6 +2,25 @@
 
 All notable changes are documented here.
 
+## [0.4.1] - 2026-07-31
+
+### Changed
+
+- Reduced median startup latency by roughly one third by lazily importing
+  network, HTTP, backup, encryption, and concurrency modules.
+- Added a schema-version fast path that avoids replaying schema and trigger DDL
+  on every command while retaining complete guard verification in `doctor`.
+- Reused fresh prices across CLI processes through the SQLite market cache and
+  increased the default quote TTL from 5 to 15 seconds.
+- Made terminal quote, trade, snapshot, and FX commands avoid a second Yahoo
+  metadata request when an indicative bid/ask is sufficient.
+- Avoided redundant database-file permission updates on every connection.
+
+### Fixed
+
+- `doctor` now verifies the complete expected data-guard count rather than
+  accepting any nonzero number of guards.
+
 ## [0.4.0] - 2026-07-31
 
 ### Added

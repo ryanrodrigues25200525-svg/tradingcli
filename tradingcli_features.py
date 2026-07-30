@@ -8,22 +8,12 @@ walk-forward research, encrypted snapshots, and a loopback HTTP API.
 
 from __future__ import annotations
 
-import csv
 from datetime import datetime, timedelta, timezone
-import hashlib
-import hmac
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import io
 import json
 import math
 import os
-from pathlib import Path
-import secrets
-import shutil
 import sqlite3
-import tempfile
 import time
-from urllib.parse import parse_qs, urlparse
 
 
 FEATURE_SCHEMA = """
@@ -472,6 +462,9 @@ def realistic_fill(conn, account, side, qty, price):
 def journal_add(
     conn, account, title, body="", tags=None, symbol=None, order_id=None, attachment=None
 ):
+    import hashlib
+    from pathlib import Path
+
     title = title.strip()
     if not title:
         raise SystemExit("journal title is required")
@@ -635,6 +628,8 @@ def run_due(conn, executor, now=None):
 
 
 def backup_inventory(database_path, manual_directory=None):
+    from pathlib import Path
+
     database = Path(database_path).expanduser().resolve()
     directories = [
         Path(manual_directory or "~/.papertrade_backups").expanduser(),
@@ -668,6 +663,8 @@ def backup_inventory(database_path, manual_directory=None):
 
 
 def prune_backups(database_path, keep=10, manual_directory=None):
+    from pathlib import Path
+
     if keep < 1:
         raise SystemExit("backup retention must keep at least one backup")
     inventory = backup_inventory(database_path, manual_directory)
@@ -686,6 +683,10 @@ def prune_backups(database_path, keep=10, manual_directory=None):
 
 
 def restore_backup(database_path, backup_path, expected_schema):
+    from pathlib import Path
+    import shutil
+    import tempfile
+
     database = Path(database_path).expanduser().resolve()
     backup = Path(backup_path).expanduser().resolve()
     if not backup.is_file():
@@ -722,6 +723,10 @@ def restore_backup(database_path, backup_path, expected_schema):
 
 def encrypt_database_copy(database_path, output_path, password):
     """Create an authenticated encrypted snapshot; the live SQLite DB stays usable."""
+    import hashlib
+    from pathlib import Path
+    import tempfile
+
     if not password:
         raise SystemExit("encryption password is required")
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -741,8 +746,8 @@ def encrypt_database_copy(database_path, output_path, password):
         snapshot.close()
     try:
         plaintext = Path(temporary).read_bytes()
-        salt = secrets.token_bytes(16)
-        nonce = secrets.token_bytes(12)
+        salt = os.urandom(16)
+        nonce = os.urandom(12)
         key = hashlib.scrypt(
             password.encode(), salt=salt, n=2**14, r=8, p=1, dklen=32
         )
@@ -755,6 +760,9 @@ def encrypt_database_copy(database_path, output_path, password):
 
 
 def decrypt_database_copy(encrypted_path, output_path, password):
+    import hashlib
+    from pathlib import Path
+
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
     source = Path(encrypted_path).expanduser().resolve().read_bytes()
@@ -783,6 +791,9 @@ def decrypt_database_copy(encrypted_path, output_path, password):
 
 
 def broker_export(conn, account, broker="generic"):
+    import csv
+    import io
+
     headers = {
         "generic": ["timestamp", "symbol", "side", "quantity", "price", "commission"],
         "alpaca": ["filled_at", "symbol", "side", "filled_qty", "filled_avg_price", "commission"],
@@ -803,6 +814,10 @@ def broker_export(conn, account, broker="generic"):
 
 
 def broker_import(conn, account, content, broker, fill_callback, source_name=None):
+    import csv
+    import hashlib
+    import io
+
     mappings = {
         "generic": ("timestamp", "symbol", "side", "quantity", "price", "commission"),
         "alpaca": ("filled_at", "symbol", "side", "filled_qty", "filled_avg_price", "commission"),
@@ -895,6 +910,12 @@ def walk_forward_sma(symbol, prices=None, short_windows=(5, 10, 20), long_window
 
 
 def serve_api(database_factory, host, port, token, allow_mutations=False):
+    # The HTTP stack imports email, MIME, SSL, and socket modules. Keep that
+    # optional cost out of every short-lived terminal command.
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import hmac
+    from urllib.parse import parse_qs, urlparse
+
     if not token or len(token) < 24:
         raise SystemExit("API token must contain at least 24 characters")
     if host not in {"127.0.0.1", "::1", "localhost"}:
@@ -1003,8 +1024,68 @@ def serve_api(database_factory, host, port, token, allow_mutations=False):
 _price_cache = {}
 
 
-def provider_price(symbol, yahoo_fetch, ttl=5.0):
-    """Price provider chain: optional static JSON, then Yahoo, with stale fallback."""
+def _persistent_price(database, provider, symbol):
+    """Read a cross-process quote cache without creating or migrating a database."""
+    if not database or database == ":memory:" or database.startswith("file:"):
+        return None
+    try:
+        conn = sqlite3.connect(
+            f"file:{os.path.abspath(os.path.expanduser(database))}?mode=ro",
+            uri=True,
+            timeout=0.05,
+        )
+        try:
+            row = conn.execute(
+                "SELECT expires,payload FROM market_cache"
+                " WHERE provider=? AND symbol=? AND kind='price'",
+                (provider, symbol),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row:
+            return {"expires": float(row[0]), "price": float(json.loads(row[1])["price"])}
+    except (KeyError, TypeError, ValueError, sqlite3.Error):
+        pass
+    return None
+
+
+def _store_persistent_price(database, provider, symbol, price, ttl):
+    if (
+        not database
+        or database == ":memory:"
+        or database.startswith("file:")
+        or ttl <= 0
+    ):
+        return
+    try:
+        conn = sqlite3.connect(
+            os.path.abspath(os.path.expanduser(database)), timeout=0.05
+        )
+        try:
+            now = time.time()
+            conn.execute(
+                "INSERT OR REPLACE INTO market_cache"
+                "(provider,symbol,kind,fetched,expires,payload) VALUES(?,?,?,?,?,?)",
+                (
+                    provider,
+                    symbol,
+                    "price",
+                    now,
+                    now + ttl,
+                    json.dumps({"price": price}, separators=(",", ":")),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        # Price delivery must not fail because an optional cache is locked,
+        # read-only, or belongs to an older schema.
+        pass
+
+
+def provider_price(symbol, yahoo_fetch, ttl=15.0, database=None):
+    """Provider chain with memory and cross-process caches plus stale fallback."""
     now = time.monotonic()
     cached = _price_cache.get(symbol)
     if cached and cached["expires"] > now:
@@ -1015,13 +1096,20 @@ def provider_price(symbol, yahoo_fetch, ttl=5.0):
         if item.strip()
     ]
     errors = []
+    persistent_stale = None
     for provider in providers:
         try:
             if provider == "static":
                 values = json.loads(os.environ.get("PAPERTRADE_STATIC_PRICES", "{}"))
                 price = float(values[symbol])
             elif provider == "yahoo":
-                price = float(yahoo_fetch())
+                persistent = _persistent_price(database, provider, symbol)
+                if persistent and persistent["expires"] > time.time():
+                    price = persistent["price"]
+                else:
+                    if persistent:
+                        persistent_stale = persistent["price"]
+                    price = float(yahoo_fetch())
             else:
                 raise ValueError(f"unknown provider {provider}")
             if not math.isfinite(price) or price <= 0:
@@ -1031,11 +1119,14 @@ def provider_price(symbol, yahoo_fetch, ttl=5.0):
                 "expires": now + ttl,
                 "provider": provider,
             }
+            _store_persistent_price(database, provider, symbol, price, ttl)
             return price
         except (Exception, SystemExit) as exc:
             errors.append(f"{provider}: {exc}")
     if cached:
         return cached["price"]
+    if persistent_stale is not None:
+        return persistent_stale
     raise SystemExit(f"all price providers failed ({'; '.join(errors)})")
 
 

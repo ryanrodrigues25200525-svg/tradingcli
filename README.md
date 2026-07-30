@@ -193,7 +193,14 @@ PAPERTRADE_API_TOKEN='replace-with-a-long-random-token' tradingcli serve
 Static prices can precede Yahoo in the provider chain for deterministic tests
 or failover. Configure `PAPERTRADE_PRICE_PROVIDERS=static,yahoo`,
 `PAPERTRADE_STATIC_PRICES='{"AAPL":185.25}'`, and optionally
-`PAPERTRADE_PRICE_CACHE_TTL`.
+`PAPERTRADE_PRICE_CACHE_TTL` (15 seconds by default). Fresh Yahoo prices are
+cached in SQLite, so separate terminal invocations can reuse them without
+another network round trip. Set the TTL to `0` when every command must fetch.
+
+Terminal quote, latest-trade, snapshot, and FX commands use a fast indicative
+quote path with `bid` and `ask` equal to the latest price. Library callers can
+request Yahoo's slower metadata lookup with
+`latest_quote("AAPL", detailed=True)`.
 
 Every command accepts one automation output flag: `--json`, `--csv`, or
 `--quiet`. `--schema` returns the command tree without accessing market data,
