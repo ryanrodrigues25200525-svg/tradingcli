@@ -4,7 +4,7 @@ A local, multi-account paper-trading CLI, live terminal dashboard, and MCP
 server. It stores portfolio state in SQLite and uses Yahoo Finance market data.
 
 Supported instruments include equities, ETFs, crypto, foreign exchange,
-futures, and equity options. The schema-v5 engine also supports stop,
+futures, and equity options. The schema-v6 engine also supports stop,
 stop-limit, trailing-stop, bracket, OCO, OTO, and multi-leg option orders.
 This is a simulation tool and does not place live brokerage orders.
 
@@ -164,6 +164,26 @@ Automations are persisted and keep run history, but TradingCLI does not install
 an operating-system daemon. Invoke `automation run-due` from cron, launchd, or
 another trusted scheduler.
 
+Local simulation operations include cache warming, streaming marks, alerts,
+reports, performance diagnostics, and shell completion:
+
+```bash
+tradingcli quotes warm AAPL MSFT
+tradingcli quotes stream AAPL MSFT --interval 5 --count 20 --check-alerts
+tradingcli quotes daemon --interval 15 --check-alerts
+tradingcli alert add aapl-breakout AAPL --above 225
+tradingcli alert check --notify
+tradingcli alert events
+tradingcli report summary --save
+tradingcli benchmark --iterations 20
+tradingcli completion zsh > ~/.zfunc/_tradingcli
+```
+
+`quotes daemon` is a foreground local cache warmer; it never routes orders.
+Alerts are stored in SQLite. `--notify` also appends triggered events to the
+owner-private `~/.papertrade_notifications.jsonl` inbox. Automations accept
+the additional safe actions `quotes`, `alerts`, and `report`.
+
 Backups can be inventoried, retained, and restored. Restore requires `--yes`
 and first creates another consistent safety backup:
 
@@ -190,8 +210,9 @@ journal entries, and order previews. Tokens must be at least 24 characters:
 PAPERTRADE_API_TOKEN='replace-with-a-long-random-token' tradingcli serve
 ```
 
-Static prices can precede Yahoo in the provider chain for deterministic tests
-or failover. Configure `PAPERTRADE_PRICE_PROVIDERS=static,yahoo`,
+Static or file-backed prices can precede Yahoo for deterministic simulations
+or failover. Configure `PAPERTRADE_PRICE_PROVIDERS=file,static,yahoo`,
+`PAPERTRADE_PRICE_FILE=./simulation-prices.json`,
 `PAPERTRADE_STATIC_PRICES='{"AAPL":185.25}'`, and optionally
 `PAPERTRADE_PRICE_CACHE_TTL` (15 seconds by default). Fresh Yahoo prices are
 cached in SQLite, so separate terminal invocations can reuse them without
@@ -244,7 +265,7 @@ forced to owner-only `0600`; the backup directory is `0700` and backups are
 `PAPERTRADE_MARKET_TIMEOUT` to change the default 15-second timeout used by
 historical-data requests.
 
-Schema v5 normalizes money to 2 decimal places, prices to 6, and quantities to
+Schema v6 normalizes money to 2 decimal places, prices to 6, and quantities to
 8 using decimal half-even rounding. SQLite guards reject invalid domains,
 orphaned account/watchlist records, and values outside those precision
 contracts—even when a caller bypasses the CLI.

@@ -52,7 +52,7 @@ def rejected(conn, sql, parameters=()):
 # Fresh databases enforce relationships, domains, and documented precision.
 pt.DB = str(root / "fresh.db")
 conn = pt.db()
-assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
 assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
 assert pt.healthcheck(conn)["status"] == "ok"
 with redirect_stdout(io.StringIO()):
@@ -92,7 +92,7 @@ migration_path = root / "migration.db"
 legacy_database(migration_path)
 pt.DB = str(migration_path)
 conn = pt.db()
-assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
 assert conn.execute(
     "SELECT cash,deposits,realized FROM accounts WHERE name='legacy'"
 ).fetchone() == (100.02, 100.02, 0.0)

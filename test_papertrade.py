@@ -426,7 +426,7 @@ legacy.close()
 os.environ["PAPERTRADE_DB"] = legacy_path
 importlib.reload(pt)
 conn = pt.db()
-assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
 assert (
     conn.execute("SELECT cash FROM accounts WHERE name='legacy'").fetchone()[0] == 1234
 )

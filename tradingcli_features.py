@@ -65,6 +65,17 @@ CREATE TABLE IF NOT EXISTS equity_peaks(
 CREATE TABLE IF NOT EXISTS broker_imports(
   fingerprint TEXT PRIMARY KEY, broker TEXT NOT NULL, imported TEXT NOT NULL,
   account TEXT NOT NULL, rows_imported INTEGER NOT NULL, source_name TEXT);
+CREATE TABLE IF NOT EXISTS alert_rules(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+  symbol TEXT NOT NULL, condition TEXT NOT NULL, threshold REAL NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1, cooldown_seconds INTEGER NOT NULL DEFAULT 300,
+  last_triggered TEXT, created TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS alert_events(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, alert_id INTEGER NOT NULL,
+  ts TEXT NOT NULL, price REAL NOT NULL, message TEXT NOT NULL,
+  acknowledged INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS idx_alert_events_alert_ts
+  ON alert_events(alert_id,ts DESC);
 """
 
 
@@ -167,6 +178,18 @@ def install_guards(conn):
               OR NEW.liquidity_fraction<=0 OR NEW.liquidity_fraction>1
               OR (NEW.max_fill_quantity IS NOT NULL AND NEW.max_fill_quantity<=0)
             BEGIN SELECT RAISE(ABORT, 'invalid execution settings'); END
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE TRIGGER IF NOT EXISTS guard_alert_rules_values_{operation.lower()}
+            BEFORE {operation} ON alert_rules
+            WHEN NEW.name IS NULL OR trim(NEW.name)=''
+              OR NEW.symbol IS NULL OR trim(NEW.symbol)=''
+              OR NEW.condition NOT IN ('above','below')
+              OR NEW.threshold<=0 OR NEW.cooldown_seconds<0
+              OR NEW.enabled NOT IN (0,1)
+            BEGIN SELECT RAISE(ABORT, 'invalid alert rule'); END
             """
         )
 
@@ -555,7 +578,7 @@ def performance_attribution(conn, account):
 
 
 def schedule_add(conn, name, action, interval_seconds, payload=None):
-    allowed = {"tick", "backup", "reconcile"}
+    allowed = {"tick", "backup", "reconcile", "quotes", "alerts", "report"}
     if action not in allowed:
         raise SystemExit(f"automation action must be one of: {', '.join(sorted(allowed))}")
     if interval_seconds < 60:
@@ -625,6 +648,135 @@ def run_due(conn, executor, now=None):
         )
         results.append({"job": name, "status": status, "output": output, "error": error})
     return results
+
+
+def alert_add(conn, name, symbol, condition, threshold, cooldown_seconds=300):
+    name, symbol = name.strip(), symbol.strip().upper()
+    if not name or not symbol:
+        raise SystemExit("alert name and symbol are required")
+    if condition not in {"above", "below"}:
+        raise SystemExit("alert condition must be above or below")
+    if not math.isfinite(float(threshold)) or float(threshold) <= 0:
+        raise SystemExit("alert threshold must be a positive finite price")
+    if cooldown_seconds < 0:
+        raise SystemExit("alert cooldown cannot be negative")
+    return conn.execute(
+        "INSERT INTO alert_rules"
+        "(name,symbol,condition,threshold,cooldown_seconds,created)"
+        " VALUES(?,?,?,?,?,?)",
+        (name, symbol, condition, float(threshold), cooldown_seconds, utcnow()),
+    ).lastrowid
+
+
+def alert_list(conn):
+    return [
+        {
+            "id": row[0],
+            "name": row[1],
+            "symbol": row[2],
+            "condition": row[3],
+            "threshold": row[4],
+            "enabled": bool(row[5]),
+            "cooldown_seconds": row[6],
+            "last_triggered": row[7],
+            "created": row[8],
+        }
+        for row in conn.execute(
+            "SELECT id,name,symbol,condition,threshold,enabled,cooldown_seconds,"
+            "last_triggered,created FROM alert_rules ORDER BY id"
+        )
+    ]
+
+
+def alert_delete(conn, alert_id):
+    if not conn.execute("SELECT 1 FROM alert_rules WHERE id=?", (alert_id,)).fetchone():
+        raise SystemExit(f"no alert #{alert_id}")
+    conn.execute("DELETE FROM alert_events WHERE alert_id=?", (alert_id,))
+    conn.execute("DELETE FROM alert_rules WHERE id=?", (alert_id,))
+
+
+def alert_check(conn, prices, now=None):
+    """Evaluate enabled local simulation alerts and append deduplicated events."""
+    now = now or datetime.now(timezone.utc)
+    triggered = []
+    for row in conn.execute(
+        "SELECT id,name,symbol,condition,threshold,cooldown_seconds,last_triggered"
+        " FROM alert_rules WHERE enabled=1 ORDER BY id"
+    ):
+        alert_id, name, symbol, condition, threshold, cooldown, last_triggered = row
+        price = prices.get(symbol)
+        if price is None:
+            continue
+        matched = price >= threshold if condition == "above" else price <= threshold
+        if not matched:
+            continue
+        if last_triggered:
+            last = datetime.fromisoformat(last_triggered)
+            if (now - last).total_seconds() < cooldown:
+                continue
+        message = f"{name}: {symbol} {price:.6g} is {condition} {threshold:.6g}"
+        stamp = now.isoformat(timespec="seconds")
+        conn.execute(
+            "INSERT INTO alert_events(alert_id,ts,price,message) VALUES(?,?,?,?)",
+            (alert_id, stamp, price, message),
+        )
+        conn.execute(
+            "UPDATE alert_rules SET last_triggered=? WHERE id=?",
+            (stamp, alert_id),
+        )
+        triggered.append(
+            {
+                "alert_id": alert_id,
+                "name": name,
+                "symbol": symbol,
+                "price": price,
+                "message": message,
+                "timestamp": stamp,
+            }
+        )
+    return triggered
+
+
+def alert_events(conn, limit=100):
+    limit = max(1, min(int(limit), 1000))
+    return [
+        {
+            "id": row[0],
+            "alert_id": row[1],
+            "name": row[2],
+            "timestamp": row[3],
+            "price": row[4],
+            "message": row[5],
+            "acknowledged": bool(row[6]),
+        }
+        for row in conn.execute(
+            "SELECT e.id,e.alert_id,r.name,e.ts,e.price,e.message,e.acknowledged"
+            " FROM alert_events e JOIN alert_rules r ON r.id=e.alert_id"
+            " ORDER BY e.id DESC LIMIT ?",
+            (limit,),
+        )
+    ]
+
+
+def write_local_notifications(events, path=None):
+    """Append alert events to an owner-private JSONL inbox for local tooling."""
+    if not events:
+        return None
+    path = os.path.abspath(
+        os.path.expanduser(
+            path
+            or os.environ.get(
+                "PAPERTRADE_NOTIFICATION_FILE", "~/.papertrade_notifications.jsonl"
+            )
+        )
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    os.fchmod(descriptor, 0o600)
+    with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+        for event in events:
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
+    return path
 
 
 def backup_inventory(database_path, manual_directory=None):
@@ -1084,6 +1236,61 @@ def _store_persistent_price(database, provider, symbol, price, ttl):
         pass
 
 
+def cached_prices(database, symbols=None, allow_stale=True):
+    """Return cached marks in one SQLite read for instant offline rendering."""
+    if not database or database == ":memory:" or database.startswith("file:"):
+        return {}
+    try:
+        conn = sqlite3.connect(
+            f"file:{os.path.abspath(os.path.expanduser(database))}?mode=ro",
+            uri=True,
+            timeout=0.05,
+        )
+        try:
+            rows = conn.execute(
+                "SELECT symbol,provider,expires,payload FROM market_cache"
+                " WHERE kind='price' ORDER BY fetched DESC"
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return {}
+    wanted = {item.upper() for item in symbols} if symbols is not None else None
+    result = {}
+    now = time.time()
+    for symbol, provider, expires, payload in rows:
+        if symbol in result or (wanted is not None and symbol not in wanted):
+            continue
+        if not allow_stale and expires <= now:
+            continue
+        try:
+            result[symbol] = {
+                "price": float(json.loads(payload)["price"]),
+                "provider": provider,
+                "expires": float(expires),
+                "stale": expires <= now,
+            }
+        except (KeyError, TypeError, ValueError):
+            continue
+    return result
+
+
+def cache_status(conn):
+    now = time.time()
+    row = conn.execute(
+        "SELECT COUNT(*),SUM(CASE WHEN expires>? THEN 1 ELSE 0 END),"
+        "MIN(fetched),MAX(fetched) FROM market_cache WHERE kind='price'",
+        (now,),
+    ).fetchone()
+    return {
+        "prices": row[0] or 0,
+        "fresh": row[1] or 0,
+        "stale": (row[0] or 0) - (row[1] or 0),
+        "oldest_fetched": row[2],
+        "newest_fetched": row[3],
+    }
+
+
 def provider_price(symbol, yahoo_fetch, ttl=15.0, database=None):
     """Provider chain with memory and cross-process caches plus stale fallback."""
     now = time.monotonic()
@@ -1099,7 +1306,13 @@ def provider_price(symbol, yahoo_fetch, ttl=15.0, database=None):
     persistent_stale = None
     for provider in providers:
         try:
-            if provider == "static":
+            if provider == "file":
+                price_path = os.environ.get("PAPERTRADE_PRICE_FILE", "")
+                if not price_path:
+                    raise ValueError("PAPERTRADE_PRICE_FILE is not set")
+                with open(os.path.expanduser(price_path), encoding="utf-8") as handle:
+                    price = float(json.load(handle)[symbol])
+            elif provider == "static":
                 values = json.loads(os.environ.get("PAPERTRADE_STATIC_PRICES", "{}"))
                 price = float(values[symbol])
             elif provider == "yahoo":
@@ -1150,14 +1363,22 @@ def feature_health(conn):
         " OR liquidity_fraction<=0 OR liquidity_fraction>1"
         " OR (max_fill_quantity IS NOT NULL AND max_fill_quantity<=0)"
     ).fetchone()[0]
+    invalid_alerts = conn.execute(
+        "SELECT COUNT(*) FROM alert_rules"
+        " WHERE name IS NULL OR trim(name)='' OR symbol IS NULL OR trim(symbol)=''"
+        " OR condition NOT IN ('above','below') OR threshold<=0"
+        " OR cooldown_seconds<0 OR enabled NOT IN (0,1)"
+    ).fetchone()[0]
     return {
         "ledger_balanced": ledger_imbalance == 0 and ledger_orphans == 0,
         "unbalanced_transactions": ledger_imbalance,
         "orphaned_ledger_entries": ledger_orphans,
         "invalid_execution_settings": invalid_execution,
+        "invalid_alert_rules": invalid_alerts,
         "valid": ledger_imbalance == 0
         and ledger_orphans == 0
-        and invalid_execution == 0,
+        and invalid_execution == 0
+        and invalid_alerts == 0,
         "journal_entries": conn.execute(
             "SELECT COUNT(*) FROM journal_entries"
         ).fetchone()[0],
@@ -1165,4 +1386,7 @@ def feature_health(conn):
             "SELECT COUNT(*) FROM automation_jobs WHERE enabled=1"
         ).fetchone()[0],
         "failed_automation_runs": failed_automations,
+        "alerts": conn.execute(
+            "SELECT COUNT(*) FROM alert_rules WHERE enabled=1"
+        ).fetchone()[0],
     }

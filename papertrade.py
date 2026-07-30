@@ -28,7 +28,7 @@ from functools import lru_cache
 import tradingcli_features as features
 
 DB = os.environ.get("PAPERTRADE_DB", os.path.expanduser("~/.papertrade.db"))
-VERSION = "0.4.1"
+VERSION = "0.5.0"
 MARKET_DATA_TIMEOUT = max(
     1.0, float(os.environ.get("PAPERTRADE_MARKET_TIMEOUT", "15"))
 )
@@ -60,8 +60,8 @@ FUTURES = {
 }
 
 OCC_RE = re.compile(r"^([A-Z]{1,6})(\d{2})(\d{2})(\d{2})([CP])(\d{8})$")
-SCHEMA_VERSION = 5
-EXPECTED_DATA_GUARDS = 54
+SCHEMA_VERSION = 6
+EXPECTED_DATA_GUARDS = 56
 MONEY_QUANTUM = Decimal("0.01")
 PRICE_QUANTUM = Decimal("0.000001")
 QUANTITY_QUANTUM = Decimal("0.00000001")
@@ -4408,9 +4408,9 @@ def pnl(conn, account, price_fn=live_price):
 
 
 def _daily_closes(symbols, start, end):
+    """{symbol: {YYYY-MM-DD: close}}. Options have no reliable history -> empty (marked flat)."""
     from concurrent.futures import ThreadPoolExecutor
 
-    """{symbol: {YYYY-MM-DD: close}}. Options have no reliable history -> empty (marked flat)."""
     _quiet_yf()
     import yfinance as yf
 
@@ -4508,9 +4508,9 @@ def _grouped_option_prices(root, expiry, legs, ignore_errors):
 
 
 def batch_prices(symbols, price_fn=None, ignore_errors=False):
+    """Fetch unique live marks concurrently while preserving input order."""
     from concurrent.futures import ThreadPoolExecutor
 
-    """Fetch unique live marks concurrently while preserving input order."""
     ordered = list(dict.fromkeys(symbols))
     price_fn = price_fn or live_price
 
@@ -4799,6 +4799,184 @@ def resolve_account(conn, account):
     return row[0]
 
 
+def tracked_symbols(conn, account=None):
+    params = ()
+    position_where = ""
+    watchlist_where = ""
+    if account:
+        position_where = " WHERE account=?"
+        watchlist_where = " WHERE w.account=?"
+        params = (account,)
+    symbols = {
+        row[0]
+        for row in conn.execute(
+            f"SELECT symbol FROM positions{position_where}", params
+        )
+    }
+    symbols.update(
+        row[0]
+        for row in conn.execute(
+            "SELECT ws.symbol FROM watchlist_symbols ws"
+            " JOIN watchlists w ON w.id=ws.watchlist_id"
+            f"{watchlist_where}",
+            params,
+        )
+    )
+    symbols.update(row[0] for row in conn.execute("SELECT symbol FROM alert_rules"))
+    return sorted(symbols)
+
+
+def warm_quotes(conn, symbols=None, account=None):
+    selected = sorted(
+        {symbol.strip().upper() for symbol in (symbols or []) if symbol.strip()}
+    )
+    if not selected:
+        selected = tracked_symbols(conn, account)
+    if not selected:
+        return {"requested": 0, "updated": 0, "failed": [], "quotes": {}}
+    prices = batch_prices(selected, ignore_errors=True)
+    return {
+        "requested": len(selected),
+        "updated": sum(price is not None for price in prices.values()),
+        "failed": [symbol for symbol, price in prices.items() if price is None],
+        "quotes": {symbol: price for symbol, price in prices.items() if price is not None},
+    }
+
+
+def simulation_report(conn, account):
+    account_row = conn.execute(
+        "SELECT cash,deposits,realized,created FROM accounts WHERE name=?",
+        (account,),
+    ).fetchone()
+    if not account_row:
+        raise SystemExit(f"no account '{account}'")
+    cash, deposits, realized, created = account_row
+    positions = conn.execute(
+        "SELECT symbol,qty,avg_cost,mult FROM positions WHERE account=?"
+        " ORDER BY symbol",
+        (account,),
+    ).fetchall()
+    cached = features.cached_prices(DB, [row[0] for row in positions])
+    fallback = {symbol: avg for symbol, _qty, avg, _mult in positions}
+    equity = current_equity(
+        conn,
+        account,
+        price_fn=lambda symbol: cached.get(symbol, {}).get(
+            "price", fallback[symbol]
+        ),
+    )
+    pending = conn.execute(
+        "SELECT COUNT(*) FROM orders WHERE account=? AND status IN ('pending','held')",
+        (account,),
+    ).fetchone()[0]
+    fills = conn.execute(
+        "SELECT COUNT(*) FROM orders WHERE account=?"
+        " AND status IN ('filled','settled','exercised','partially_filled')",
+        (account,),
+    ).fetchone()[0]
+    return {
+        "kind": "local-paper-trading-summary",
+        "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "account": account,
+        "account_created": created,
+        "cash": _money(cash),
+        "deposits": _money(deposits),
+        "realized": _money(realized),
+        "equity": _money(equity),
+        "return": round((equity / deposits - 1) if deposits else 0, 8),
+        "positions": len(positions),
+        "cached_marks": len(cached),
+        "stale_marks": sum(mark["stale"] for mark in cached.values()),
+        "pending_orders": pending,
+        "completed_orders": fills,
+        "ledger": features.reconcile(conn, account),
+        "live_execution": False,
+    }
+
+
+def save_simulation_report(report, output=None):
+    if output:
+        path = os.path.abspath(os.path.expanduser(output))
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    else:
+        directory = os.path.expanduser("~/.papertrade_reports")
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        os.chmod(directory, 0o700)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        path = os.path.join(directory, f"{report['account']}-{stamp}.json")
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2)
+        handle.write("\n")
+    return path
+
+
+def terminal_benchmark(iterations=10):
+    import subprocess
+
+    iterations = max(3, min(int(iterations), 100))
+    startup = []
+    database = []
+    command = [sys.executable, "-m", "papertrade", "--version"]
+    for _ in range(iterations):
+        started = time.perf_counter()
+        subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+        startup.append((time.perf_counter() - started) * 1000)
+        started = time.perf_counter()
+        conn = db()
+        conn.execute("SELECT COUNT(*) FROM accounts").fetchone()
+        conn.close()
+        database.append((time.perf_counter() - started) * 1000)
+    startup.sort()
+    database.sort()
+    middle = iterations // 2
+    return {
+        "iterations": iterations,
+        "startup_median_ms": round(startup[middle], 3),
+        "startup_p95_ms": round(startup[min(iterations - 1, math.ceil(iterations * 0.95) - 1)], 3),
+        "database_median_ms": round(database[middle], 3),
+        "database_p95_ms": round(database[min(iterations - 1, math.ceil(iterations * 0.95) - 1)], 3),
+        "budgets_ms": {"startup": 75, "database": 10},
+        "passes": {
+            "startup": startup[middle] < 75,
+            "database": database[middle] < 10,
+        },
+    }
+
+
+def completion_script(shell):
+    commands = sorted(
+        {
+            "new", "accounts", "use", "buy", "sell", "order", "position",
+            "option", "watchlist", "data", "quotes", "alert", "report",
+            "automation", "benchmark", "doctor", "dash", "completion",
+        }
+    )
+    words = " ".join(commands)
+    if shell == "bash":
+        return (
+            "_tradingcli_complete() { COMPREPLY=( $(compgen -W '"
+            + words
+            + "' -- \"${COMP_WORDS[COMP_CWORD]}\") ); }\n"
+            "complete -F _tradingcli_complete tradingcli\n"
+        )
+    if shell == "zsh":
+        return (
+            "#compdef tradingcli\n"
+            "_tradingcli() { local -a commands; commands=("
+            + words
+            + "); _describe 'command' commands; }\ncompdef _tradingcli tradingcli\n"
+        )
+    if shell == "fish":
+        return f"complete -c tradingcli -f -a '{words}'\n"
+    raise SystemExit("shell must be bash, zsh, or fish")
+
+
 CLI_COMMAND_TREE = {
     "account": ["new", "accounts", "use", "rename", "deposit", "withdraw", "risk"],
     "order": ["submit", "list", "get", "replace", "cancel", "cancel-all", "preview"],
@@ -4833,6 +5011,11 @@ CLI_COMMAND_TREE = {
         "execution",
         "journal",
         "automation",
+        "quotes",
+        "alert",
+        "report",
+        "benchmark",
+        "completion",
         "strategy",
         "broker",
         "security",
@@ -5136,13 +5319,64 @@ def _build_parser():
     automation_sub = automation.add_subparsers(dest="automation_cmd", required=True)
     automation_add = automation_sub.add_parser("add")
     automation_add.add_argument("name")
-    automation_add.add_argument("action", choices=["tick", "backup", "reconcile"])
+    automation_add.add_argument(
+        "action",
+        choices=["tick", "backup", "reconcile", "quotes", "alerts", "report"],
+    )
     automation_add.add_argument("--interval-seconds", type=int, required=True)
     automation_add.add_argument("--account")
     automation_sub.add_parser("list")
     automation_sub.add_parser("run-due")
     automation_history = automation_sub.add_parser("history")
     automation_history.add_argument("--limit", type=int, default=100)
+
+    quotes = sub.add_parser("quotes", help="local quote cache and streaming")
+    quotes_sub = quotes.add_subparsers(dest="quotes_cmd", required=True)
+    quotes_sub.add_parser("status")
+    quotes_sub.add_parser("clear")
+    quotes_warm = quotes_sub.add_parser("warm")
+    quotes_warm.add_argument("symbols", nargs="*")
+    quotes_warm.add_argument("-a", "--account")
+    quotes_stream = quotes_sub.add_parser("stream")
+    quotes_stream.add_argument("symbols", nargs="+")
+    quotes_stream.add_argument("--interval", type=float, default=5)
+    quotes_stream.add_argument("--count", type=int, default=0)
+    quotes_stream.add_argument("--check-alerts", action="store_true")
+    quotes_daemon = quotes_sub.add_parser("daemon")
+    quotes_daemon.add_argument("-a", "--account")
+    quotes_daemon.add_argument("--interval", type=float, default=15)
+    quotes_daemon.add_argument("--count", type=int, default=0)
+    quotes_daemon.add_argument("--check-alerts", action="store_true")
+
+    alert = sub.add_parser("alert", help="local simulation price alerts")
+    alert_sub = alert.add_subparsers(dest="alert_cmd", required=True)
+    alert_add_parser = alert_sub.add_parser("add")
+    alert_add_parser.add_argument("name")
+    alert_add_parser.add_argument("symbol")
+    threshold = alert_add_parser.add_mutually_exclusive_group(required=True)
+    threshold.add_argument("--above", type=float)
+    threshold.add_argument("--below", type=float)
+    alert_add_parser.add_argument("--cooldown-seconds", type=int, default=300)
+    alert_sub.add_parser("list")
+    alert_delete_parser = alert_sub.add_parser("delete")
+    alert_delete_parser.add_argument("alert_id", type=int)
+    alert_check_parser = alert_sub.add_parser("check")
+    alert_check_parser.add_argument("--notify", action="store_true")
+    alert_events_parser = alert_sub.add_parser("events")
+    alert_events_parser.add_argument("--limit", type=int, default=100)
+
+    report = sub.add_parser("report", help="offline simulation reports")
+    report_sub = report.add_subparsers(dest="report_cmd", required=True)
+    report_summary = report_sub.add_parser("summary")
+    report_summary.add_argument("-a", "--account")
+    report_summary.add_argument("--save", action="store_true")
+    report_summary.add_argument("--output")
+
+    benchmark = sub.add_parser("benchmark", help="measure local terminal performance")
+    benchmark.add_argument("--iterations", type=int, default=10)
+
+    completion = sub.add_parser("completion", help="generate shell completion")
+    completion.add_argument("shell", choices=["bash", "zsh", "fish"])
 
     strategy = sub.add_parser("strategy")
     strategy_sub = strategy.add_subparsers(dest="strategy_cmd", required=True)
@@ -5278,6 +5512,12 @@ def _run_cli(args):
         if args.interval is not None:
             dash_argv += ["-n", str(args.interval)]
         os.execv(sys.executable, dash_argv)
+    if args.cmd == "completion":
+        print(completion_script(args.shell), end="")
+        return
+    if args.cmd == "benchmark":
+        print(json.dumps(terminal_benchmark(args.iterations), indent=2))
+        return
     if args.cmd == "chain":
         show_chain(args.underlying, args.expiry)
         return
@@ -5748,11 +5988,123 @@ def _run_cli(args):
                         return {"ticked": True}
                     if action == "backup":
                         return {"backup": os.path.basename(backup_database(conn))}
+                    if action == "quotes":
+                        return warm_quotes(conn, account=payload.get("account"))
+                    if action == "alerts":
+                        rules = features.alert_list(conn)
+                        prices = batch_prices(
+                            sorted({rule["symbol"] for rule in rules}),
+                            ignore_errors=True,
+                        )
+                        with writing(conn):
+                            events = features.alert_check(conn, prices)
+                        return {"triggered": events}
+                    if action == "report":
+                        account = resolve_account(conn, payload.get("account"))
+                        report = simulation_report(conn, account)
+                        return {
+                            "report": os.path.basename(
+                                save_simulation_report(report)
+                            )
+                        }
                     account = resolve_account(conn, payload.get("account"))
                     with writing(conn):
                         return features.reconcile(conn, account, repair=True)
 
                 result = features.run_due(conn, execute_automation)
+            print(json.dumps(result, indent=2))
+        elif args.cmd == "quotes":
+            if args.quotes_cmd == "status":
+                result = features.cache_status(conn)
+                result["entries"] = features.cached_prices(DB)
+                print(json.dumps(result, indent=2))
+            elif args.quotes_cmd == "clear":
+                with writing(conn):
+                    removed = conn.execute(
+                        "DELETE FROM market_cache WHERE kind='price'"
+                    ).rowcount
+                features._price_cache.clear()
+                print(json.dumps({"removed": removed}, indent=2))
+            elif args.quotes_cmd == "warm":
+                print(
+                    json.dumps(
+                        warm_quotes(conn, args.symbols, args.account),
+                        indent=2,
+                    )
+                )
+            else:
+                interval = max(0.1, float(args.interval))
+                remaining = max(0, int(args.count))
+                iteration = 0
+                while remaining == 0 or iteration < remaining:
+                    symbols = (
+                        args.symbols
+                        if args.quotes_cmd == "stream"
+                        else tracked_symbols(conn, args.account)
+                    )
+                    result = warm_quotes(conn, symbols)
+                    events = []
+                    if args.check_alerts:
+                        with writing(conn):
+                            events = features.alert_check(conn, result["quotes"])
+                    payload = {
+                        "timestamp": datetime.now(timezone.utc).isoformat(
+                            timespec="seconds"
+                        ),
+                        **result,
+                        "alerts": events,
+                    }
+                    print(json.dumps(payload, separators=(",", ":")), flush=True)
+                    iteration += 1
+                    if remaining and iteration >= remaining:
+                        break
+                    time.sleep(interval)
+        elif args.cmd == "alert":
+            if args.alert_cmd == "add":
+                condition = "above" if args.above is not None else "below"
+                threshold = args.above if args.above is not None else args.below
+                with writing(conn):
+                    alert_id = features.alert_add(
+                        conn,
+                        args.name,
+                        args.symbol,
+                        condition,
+                        threshold,
+                        args.cooldown_seconds,
+                    )
+                result = {"id": alert_id, "created": args.name}
+            elif args.alert_cmd == "list":
+                result = features.alert_list(conn)
+            elif args.alert_cmd == "delete":
+                with writing(conn):
+                    features.alert_delete(conn, args.alert_id)
+                result = {"deleted": args.alert_id}
+            elif args.alert_cmd == "events":
+                result = features.alert_events(conn, args.limit)
+            else:
+                rules = features.alert_list(conn)
+                prices = batch_prices(
+                    sorted({rule["symbol"] for rule in rules}),
+                    ignore_errors=True,
+                )
+                with writing(conn):
+                    events = features.alert_check(conn, prices)
+                notification_path = (
+                    features.write_local_notifications(events)
+                    if args.notify
+                    else None
+                )
+                result = {
+                    "checked": len(prices),
+                    "triggered": events,
+                    "notification_file": notification_path,
+                }
+            print(json.dumps(result, indent=2))
+        elif args.cmd == "report":
+            account = resolve_account(conn, args.account)
+            result = simulation_report(conn, account)
+            if args.save or args.output:
+                result["saved_to"] = save_simulation_report(result, args.output)
             print(json.dumps(result, indent=2))
         elif args.cmd == "strategy":
             print(

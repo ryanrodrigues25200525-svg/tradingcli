@@ -2,6 +2,27 @@
 
 All notable changes are documented here.
 
+## [0.5.0] - 2026-07-31
+
+### Added
+
+- Local quote-cache status, clearing, warming, foreground streaming, and daemon
+  commands.
+- Persistent above/below simulation alerts with cooldowns, event history, and
+  an owner-private JSONL notification inbox.
+- Offline account summary reports with cached marks and balanced-ledger state.
+- Terminal startup/database benchmarks with explicit performance budgets.
+- Bash, Zsh, and Fish completion generators.
+- File-backed deterministic price provider for repeatable simulations.
+- Scheduler actions for quote warming, alert checks, and simulation reports.
+- Offline-first dashboard marks loaded from SQLite before network refresh.
+
+### Changed
+
+- Schema version 6 adds alert rules and persistent alert event history.
+- Product scope is explicitly local paper trading and simulation; no live
+  brokerage execution or credential workflow was added.
+
 ## [0.4.1] - 2026-07-31
 
 ### Changed

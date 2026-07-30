@@ -1003,10 +1003,16 @@ def run_dashboard(console, args):
             scroll = 0
             compact = False
             prices = {}
-            quotes = {}  # last-known quotes; carried across cycles for an instant first paint
+            quotes = {}  # seeded from SQLite below for an instant offline first paint
             pending = None  # set below; declared here so the first redraw() can read it
             next_refresh_at = None  # ditto -- set once the first fetch lands
             data, symbols, default = snapshot(args.account)
+            cached = pt.features.cached_prices(pt.DB, symbols)
+            quotes = {
+                symbol: (mark["price"], None)
+                for symbol, mark in cached.items()
+            }
+            prices = {symbol: quote[0] for symbol, quote in quotes.items()}
 
             def redraw():
                 max_scroll = max(0, len(data) - PAGE_SIZE)

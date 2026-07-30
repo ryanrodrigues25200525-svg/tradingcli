@@ -147,7 +147,7 @@ assert json.loads(mcp.account_activity("agent"))
 assert json.loads(mcp.trading_calendar("2026-07-01", "2026-07-06"))
 
 health = json.loads(mcp.healthcheck())
-assert health["status"] == "ok" and health["schema_version"] == 5
+assert health["status"] == "ok" and health["schema_version"] == 6
 clock = json.loads(mcp.market_status())
 assert clock["market"] == "NYSE" and clock["status"] in ("open", "closed")
 catalog = json.loads(mcp.mcp_catalog())

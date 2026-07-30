@@ -1,4 +1,4 @@
-"""Regression coverage for the Alpaca-style schema v5 feature set."""
+"""Regression coverage for the Alpaca-style schema feature set."""
 
 import importlib
 import json
@@ -28,7 +28,7 @@ def no_price(_symbol):
 
 
 conn = pt.db()
-assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
 assert {
     "order_type",
     "stop_price",
@@ -352,7 +352,7 @@ buffer = pt.io.StringIO()
 with pt.contextlib.redirect_stdout(buffer):
     pt.main(["--schema"])
 assert "order" in json.loads(buffer.getvalue())
-assert pt.healthcheck(conn)["schema_version"] == 5
+assert pt.healthcheck(conn)["schema_version"] == 6
 conn.close()
 
 # v2 -> v5 migration preserves accounts and fills new columns/tables.
@@ -381,7 +381,7 @@ legacy.close()
 os.environ["PAPERTRADE_DB"] = legacy_path
 importlib.reload(pt)
 migrated = pt.db()
-assert migrated.execute("PRAGMA user_version").fetchone()[0] == 5
+assert migrated.execute("PRAGMA user_version").fetchone()[0] == 6
 assert (
     migrated.execute("SELECT cash FROM accounts WHERE name='legacy'").fetchone()[0]
     == 1234
