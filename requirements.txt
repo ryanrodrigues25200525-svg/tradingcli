@@ -4,6 +4,6 @@ exchange-calendars>=4.13,<5
 mcp>=1.27,<2
 numpy>=2,<3
 pandas>=2.2,<4
-rich>=13,<15
+rich>=13,<16
 skfolio>=0.6,<1
 yfinance>=1,<2
