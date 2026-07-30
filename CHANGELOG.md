@@ -2,6 +2,23 @@
 
 All notable changes are documented here.
 
+## [0.3.0] - 2026-07-30
+
+### Added
+
+- Automatic private, transactionally consistent backups before schema upgrades.
+- SQLite relationship, domain, and precision guards for portfolio state.
+- Logical-integrity and fixed-precision details in `doctor`.
+- Migration, rollback, corruption, future-schema, and precision contracts.
+
+### Changed
+
+- Monetary values use 2 decimal places, prices 6, and quantities 8 with
+  deterministic decimal half-even normalization.
+- Schema upgrades validate data before committing and refuse newer schemas.
+- Trade, cashflow, corporate-action, order, and risk writes normalize values at
+  storage boundaries.
+
 ## [0.2.0] - 2026-07-30
 
 ### Added

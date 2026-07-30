@@ -24,10 +24,11 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from functools import lru_cache
 
 DB = os.environ.get("PAPERTRADE_DB", os.path.expanduser("~/.papertrade.db"))
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 MARKET_DATA_TIMEOUT = max(
     1.0, float(os.environ.get("PAPERTRADE_MARKET_TIMEOUT", "15"))
 )
@@ -59,7 +60,10 @@ FUTURES = {
 }
 
 OCC_RE = re.compile(r"^([A-Z]{1,6})(\d{2})(\d{2})(\d{2})([CP])(\d{8})$")
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+MONEY_QUANTUM = Decimal("0.01")
+PRICE_QUANTUM = Decimal("0.000001")
+QUANTITY_QUANTUM = Decimal("0.00000001")
 DEFAULT_RISK = {
     "allow_short": True,
     "allow_naked_options": False,
@@ -111,6 +115,381 @@ CREATE TABLE IF NOT EXISTS option_instructions(account TEXT NOT NULL,
   source TEXT NOT NULL DEFAULT 'unknown', request_id TEXT,
   PRIMARY KEY(account, symbol));
 """
+
+
+def _fixed(value, quantum, label):
+    """Return a finite float normalized with decimal half-even rounding."""
+    try:
+        decimal_value = Decimal(str(value))
+        if not decimal_value.is_finite():
+            raise InvalidOperation
+        return float(decimal_value.quantize(quantum, rounding=ROUND_HALF_EVEN))
+    except (InvalidOperation, TypeError, ValueError):
+        raise SystemExit(f"{label} must be a finite number") from None
+
+
+def _money(value):
+    return _fixed(value, MONEY_QUANTUM, "money amount")
+
+
+def _price(value):
+    return _fixed(value, PRICE_QUANTUM, "price")
+
+
+def _quantity(value):
+    return _fixed(value, QUANTITY_QUANTUM, "quantity")
+
+
+def _install_guard(conn, table, condition, message):
+    """Install equivalent INSERT/UPDATE guards for one table invariant."""
+    safe_name = re.sub(r"[^a-z0-9]+", "_", message.lower()).strip("_")[:40]
+    for operation in ("INSERT", "UPDATE"):
+        conn.execute(
+            f"""
+            CREATE TRIGGER IF NOT EXISTS guard_{table}_{safe_name}_{operation.lower()}
+            BEFORE {operation} ON {table}
+            WHEN {condition}
+            BEGIN
+              SELECT RAISE(ABORT, '{message}');
+            END
+            """
+        )
+
+
+def _install_data_guards(conn):
+    """Move critical domain and relationship validation into SQLite."""
+    account_children = (
+        "positions",
+        "orders",
+        "cashflow",
+        "risk_settings",
+        "corporate_actions",
+        "corporate_sync",
+        "watchlists",
+        "option_instructions",
+    )
+    for table in account_children:
+        _install_guard(
+            conn,
+            table,
+            "NEW.account IS NULL OR NOT EXISTS"
+            " (SELECT 1 FROM accounts WHERE name=NEW.account)",
+            f"{table} account does not exist",
+        )
+    _install_guard(
+        conn,
+        "watchlist_symbols",
+        "NEW.watchlist_id IS NULL OR NOT EXISTS"
+        " (SELECT 1 FROM watchlists WHERE id=NEW.watchlist_id)",
+        "watchlist does not exist",
+    )
+    account_references = " OR ".join(
+        f"EXISTS(SELECT 1 FROM {table} WHERE account=OLD.name)"
+        for table in account_children
+    )
+    conn.execute(
+        f"""
+        CREATE TRIGGER IF NOT EXISTS guard_accounts_referenced_delete
+        BEFORE DELETE ON accounts
+        WHEN {account_references}
+        BEGIN
+          SELECT RAISE(ABORT, 'account is still referenced');
+        END
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE TRIGGER IF NOT EXISTS guard_accounts_referenced_name_update
+        BEFORE UPDATE OF name ON accounts
+        WHEN OLD.name<>NEW.name AND ({account_references})
+        BEGIN
+          SELECT RAISE(ABORT, 'account is still referenced');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS guard_watchlists_referenced_delete
+        BEFORE DELETE ON watchlists
+        WHEN EXISTS(SELECT 1 FROM watchlist_symbols WHERE watchlist_id=OLD.id)
+        BEGIN
+          SELECT RAISE(ABORT, 'watchlist is still referenced');
+        END
+        """
+    )
+    _install_guard(
+        conn,
+        "accounts",
+        "NEW.name IS NULL OR trim(NEW.name)='' OR NEW.cash IS NULL"
+        " OR NEW.cash<0 OR abs(NEW.cash)>1e15"
+        " OR NEW.deposits IS NULL OR abs(NEW.deposits)>1e15"
+        " OR NEW.realized IS NULL OR abs(NEW.realized)>1e15"
+        " OR abs(NEW.cash*100-round(NEW.cash*100))>0.000001"
+        " OR abs(NEW.deposits*100-round(NEW.deposits*100))>0.000001"
+        " OR abs(NEW.realized*100-round(NEW.realized*100))>0.000001",
+        "invalid account values",
+    )
+    _install_guard(
+        conn,
+        "positions",
+        "NEW.symbol IS NULL OR trim(NEW.symbol)='' OR NEW.qty IS NULL OR NEW.qty=0"
+        " OR abs(NEW.qty)>1e12 OR NEW.avg_cost IS NULL OR NEW.avg_cost<0"
+        " OR abs(NEW.avg_cost)>1e15 OR NEW.mult IS NULL OR NEW.mult<=0"
+        " OR NEW.margin IS NULL OR NEW.margin<0"
+        " OR abs(NEW.qty*1e8-round(NEW.qty*1e8))>0.000001"
+        " OR abs(NEW.avg_cost*1e6-round(NEW.avg_cost*1e6))>0.000001"
+        " OR abs(NEW.mult*1e8-round(NEW.mult*1e8))>0.000001"
+        " OR abs(NEW.margin*100-round(NEW.margin*100))>0.000001"
+        " OR NEW.asset_class NOT IN ('spot','future','option')",
+        "invalid position values",
+    )
+    _install_guard(
+        conn,
+        "orders",
+        "NEW.symbol IS NULL OR trim(NEW.symbol)='' OR NEW.side NOT IN ('buy','sell')"
+        " OR NEW.qty IS NULL OR NEW.qty<=0 OR abs(NEW.qty)>1e12"
+        " OR NEW.status NOT IN"
+        " ('pending','held','filled','canceled','rejected','replaced','expired',"
+        "  'settled','exercised')"
+        " OR NEW.order_type NOT IN"
+        " ('market','limit','stop','stop_limit','trailing_stop')"
+        " OR NEW.time_in_force NOT IN ('gtc','day','ioc','fok','opg','cls')"
+        " OR NEW.order_class NOT IN ('simple','bracket','oco','oto','mleg')"
+        " OR NEW.extended_hours NOT IN (0,1) OR NEW.triggered NOT IN (0,1)"
+        " OR (NEW.limit_price IS NOT NULL AND NEW.limit_price<=0)"
+        " OR (NEW.filled_price IS NOT NULL AND NEW.filled_price<0)"
+        " OR (NEW.stop_price IS NOT NULL AND NEW.stop_price<=0)"
+        " OR (NEW.trail_price IS NOT NULL AND NEW.trail_price<=0)"
+        " OR (NEW.trail_percent IS NOT NULL AND NEW.trail_percent<=0)"
+        " OR (NEW.notional IS NOT NULL AND NEW.notional<=0)"
+        " OR abs(NEW.qty*1e8-round(NEW.qty*1e8))>0.000001"
+        " OR (NEW.limit_price IS NOT NULL"
+        " AND abs(NEW.limit_price*1e6-round(NEW.limit_price*1e6))>0.000001)"
+        " OR (NEW.filled_price IS NOT NULL"
+        " AND abs(NEW.filled_price*1e6-round(NEW.filled_price*1e6))>0.000001)"
+        " OR (NEW.stop_price IS NOT NULL"
+        " AND abs(NEW.stop_price*1e6-round(NEW.stop_price*1e6))>0.000001)"
+        " OR (NEW.trail_price IS NOT NULL"
+        " AND abs(NEW.trail_price*1e6-round(NEW.trail_price*1e6))>0.000001)"
+        " OR (NEW.trail_percent IS NOT NULL"
+        " AND abs(NEW.trail_percent*1e8-round(NEW.trail_percent*1e8))>0.000001)"
+        " OR (NEW.notional IS NOT NULL"
+        " AND abs(NEW.notional*100-round(NEW.notional*100))>0.000001)",
+        "invalid order values",
+    )
+    _install_guard(
+        conn,
+        "cashflow",
+        "NEW.amount IS NULL OR abs(NEW.amount)>1e15"
+        " OR abs(NEW.amount*100-round(NEW.amount*100))>0.000001",
+        "invalid cashflow values",
+    )
+    _install_guard(
+        conn,
+        "risk_settings",
+        "NEW.allow_short NOT IN (0,1) OR NEW.allow_naked_options NOT IN (0,1)"
+        " OR NEW.max_gross_leverage IS NULL OR NEW.max_gross_leverage<=0"
+        " OR abs(NEW.max_gross_leverage*1e8"
+        " -round(NEW.max_gross_leverage*1e8))>0.000001"
+        " OR (NEW.max_order_notional IS NOT NULL AND NEW.max_order_notional<=0)"
+        " OR (NEW.max_order_notional IS NOT NULL"
+        " AND abs(NEW.max_order_notional*100"
+        " -round(NEW.max_order_notional*100))>0.000001)",
+        "invalid risk settings",
+    )
+    _install_guard(
+        conn,
+        "corporate_actions",
+        "NEW.kind NOT IN ('split','dividend') OR NEW.value IS NULL OR NEW.value<=0"
+        " OR NEW.cash_effect IS NULL OR abs(NEW.cash_effect)>1e15"
+        " OR abs(NEW.value*1e8-round(NEW.value*1e8))>0.000001"
+        " OR abs(NEW.cash_effect*100-round(NEW.cash_effect*100))>0.000001",
+        "invalid corporate action",
+    )
+    _install_guard(
+        conn,
+        "corporate_sync",
+        "NEW.symbol IS NULL OR trim(NEW.symbol)=''"
+        " OR NEW.last_date IS NULL OR trim(NEW.last_date)=''",
+        "invalid corporate sync",
+    )
+    _install_guard(
+        conn,
+        "watchlists",
+        "NEW.name IS NULL OR trim(NEW.name)=''"
+        " OR NEW.created IS NULL OR trim(NEW.created)=''",
+        "invalid watchlist",
+    )
+    _install_guard(
+        conn,
+        "watchlist_symbols",
+        "NEW.symbol IS NULL OR trim(NEW.symbol)='' OR NEW.position<0",
+        "invalid watchlist symbol",
+    )
+    _install_guard(
+        conn,
+        "option_instructions",
+        "NEW.symbol IS NULL OR trim(NEW.symbol)=''"
+        " OR NEW.instruction NOT IN ('exercise','do_not_exercise')"
+        " OR (NEW.qty IS NOT NULL AND NEW.qty<=0)"
+        " OR (NEW.qty IS NOT NULL"
+        " AND abs(NEW.qty*1e8-round(NEW.qty*1e8))>0.000001)",
+        "invalid option instruction",
+    )
+
+
+def _database_invariants(conn):
+    """Count logical violations that SQLite's page check cannot detect."""
+    orphan_checks = {
+        table: conn.execute(
+            f"SELECT COUNT(*) FROM {table} child"
+            " LEFT JOIN accounts parent ON parent.name=child.account"
+            " WHERE parent.name IS NULL"
+        ).fetchone()[0]
+        for table in (
+            "positions",
+            "orders",
+            "cashflow",
+            "risk_settings",
+            "corporate_actions",
+            "corporate_sync",
+            "watchlists",
+            "option_instructions",
+        )
+    }
+    orphan_checks["watchlist_symbols"] = conn.execute(
+        "SELECT COUNT(*) FROM watchlist_symbols child"
+        " LEFT JOIN watchlists parent ON parent.id=child.watchlist_id"
+        " WHERE parent.id IS NULL"
+    ).fetchone()[0]
+    domain_violations = {
+        "accounts": conn.execute(
+            "SELECT COUNT(*) FROM accounts WHERE name IS NULL OR trim(name)=''"
+            " OR cash IS NULL OR cash<0 OR abs(cash)>1e15"
+            " OR deposits IS NULL OR abs(deposits)>1e15"
+            " OR realized IS NULL OR abs(realized)>1e15"
+        ).fetchone()[0],
+        "positions": conn.execute(
+            "SELECT COUNT(*) FROM positions WHERE symbol IS NULL OR trim(symbol)=''"
+            " OR qty IS NULL OR qty=0 OR abs(qty)>1e12"
+            " OR avg_cost IS NULL OR avg_cost<0 OR mult IS NULL OR mult<=0"
+            " OR margin IS NULL OR margin<0"
+            " OR asset_class NOT IN ('spot','future','option')"
+        ).fetchone()[0],
+        "orders": conn.execute(
+            "SELECT COUNT(*) FROM orders WHERE symbol IS NULL OR trim(symbol)=''"
+            " OR side NOT IN ('buy','sell') OR qty IS NULL OR qty<=0"
+            " OR status NOT IN"
+            " ('pending','held','filled','canceled','rejected','replaced','expired',"
+            "  'settled','exercised')"
+            " OR order_type NOT IN ('market','limit','stop','stop_limit','trailing_stop')"
+            " OR time_in_force NOT IN ('gtc','day','ioc','fok','opg','cls')"
+            " OR order_class NOT IN ('simple','bracket','oco','oto','mleg')"
+            " OR extended_hours NOT IN (0,1) OR triggered NOT IN (0,1)"
+            " OR (limit_price IS NOT NULL AND limit_price<=0)"
+            " OR (filled_price IS NOT NULL AND filled_price<0)"
+            " OR (stop_price IS NOT NULL AND stop_price<=0)"
+            " OR (trail_price IS NOT NULL AND trail_price<=0)"
+            " OR (trail_percent IS NOT NULL AND trail_percent<=0)"
+            " OR (notional IS NOT NULL AND notional<=0)"
+        ).fetchone()[0],
+        "cashflow": conn.execute(
+            "SELECT COUNT(*) FROM cashflow"
+            " WHERE amount IS NULL OR abs(amount)>1e15"
+        ).fetchone()[0],
+        "risk_settings": conn.execute(
+            "SELECT COUNT(*) FROM risk_settings"
+            " WHERE allow_short NOT IN (0,1) OR allow_naked_options NOT IN (0,1)"
+            " OR max_gross_leverage IS NULL OR max_gross_leverage<=0"
+            " OR (max_order_notional IS NOT NULL AND max_order_notional<=0)"
+        ).fetchone()[0],
+        "corporate_actions": conn.execute(
+            "SELECT COUNT(*) FROM corporate_actions"
+            " WHERE symbol IS NULL OR trim(symbol)=''"
+            " OR kind NOT IN ('split','dividend') OR value IS NULL OR value<=0"
+            " OR cash_effect IS NULL OR abs(cash_effect)>1e15"
+        ).fetchone()[0],
+        "corporate_sync": conn.execute(
+            "SELECT COUNT(*) FROM corporate_sync"
+            " WHERE symbol IS NULL OR trim(symbol)=''"
+            " OR last_date IS NULL OR trim(last_date)=''"
+        ).fetchone()[0],
+        "watchlists": conn.execute(
+            "SELECT COUNT(*) FROM watchlists"
+            " WHERE name IS NULL OR trim(name)=''"
+            " OR created IS NULL OR trim(created)=''"
+        ).fetchone()[0],
+        "watchlist_symbols": conn.execute(
+            "SELECT COUNT(*) FROM watchlist_symbols"
+            " WHERE symbol IS NULL OR trim(symbol)='' OR position<0"
+        ).fetchone()[0],
+        "option_instructions": conn.execute(
+            "SELECT COUNT(*) FROM option_instructions"
+            " WHERE symbol IS NULL OR trim(symbol)=''"
+            " OR instruction NOT IN ('exercise','do_not_exercise')"
+            " OR (qty IS NOT NULL AND qty<=0)"
+        ).fetchone()[0],
+    }
+    precision_violations = {
+        "accounts": conn.execute(
+            "SELECT COUNT(*) FROM accounts"
+            " WHERE abs(cash*100-round(cash*100))>0.000001"
+            " OR abs(deposits*100-round(deposits*100))>0.000001"
+            " OR abs(realized*100-round(realized*100))>0.000001"
+        ).fetchone()[0],
+        "cashflow": conn.execute(
+            "SELECT COUNT(*) FROM cashflow"
+            " WHERE abs(amount*100-round(amount*100))>0.000001"
+        ).fetchone()[0],
+        "positions": conn.execute(
+            "SELECT COUNT(*) FROM positions"
+            " WHERE abs(qty*1e8-round(qty*1e8))>0.000001"
+            " OR abs(avg_cost*1e6-round(avg_cost*1e6))>0.000001"
+            " OR abs(mult*1e8-round(mult*1e8))>0.000001"
+            " OR abs(margin*100-round(margin*100))>0.000001"
+        ).fetchone()[0],
+        "orders": conn.execute(
+            "SELECT COUNT(*) FROM orders"
+            " WHERE abs(qty*1e8-round(qty*1e8))>0.000001"
+            " OR (limit_price IS NOT NULL"
+            " AND abs(limit_price*1e6-round(limit_price*1e6))>0.000001)"
+            " OR (filled_price IS NOT NULL"
+            " AND abs(filled_price*1e6-round(filled_price*1e6))>0.000001)"
+            " OR (stop_price IS NOT NULL"
+            " AND abs(stop_price*1e6-round(stop_price*1e6))>0.000001)"
+            " OR (trail_price IS NOT NULL"
+            " AND abs(trail_price*1e6-round(trail_price*1e6))>0.000001)"
+            " OR (trail_percent IS NOT NULL"
+            " AND abs(trail_percent*1e8-round(trail_percent*1e8))>0.000001)"
+            " OR (notional IS NOT NULL"
+            " AND abs(notional*100-round(notional*100))>0.000001)"
+        ).fetchone()[0],
+        "risk_settings": conn.execute(
+            "SELECT COUNT(*) FROM risk_settings"
+            " WHERE abs(max_gross_leverage*1e8"
+            " -round(max_gross_leverage*1e8))>0.000001"
+            " OR (max_order_notional IS NOT NULL"
+            " AND abs(max_order_notional*100-round(max_order_notional*100))>0.000001)"
+        ).fetchone()[0],
+        "corporate_actions": conn.execute(
+            "SELECT COUNT(*) FROM corporate_actions"
+            " WHERE abs(value*1e8-round(value*1e8))>0.000001"
+            " OR abs(cash_effect*100-round(cash_effect*100))>0.000001"
+        ).fetchone()[0],
+        "option_instructions": conn.execute(
+            "SELECT COUNT(*) FROM option_instructions"
+            " WHERE qty IS NOT NULL"
+            " AND abs(qty*1e8-round(qty*1e8))>0.000001"
+        ).fetchone()[0],
+    }
+    return {
+        "orphans": orphan_checks,
+        "domain": domain_violations,
+        "precision": precision_violations,
+        "total": sum(orphan_checks.values())
+        + sum(domain_violations.values())
+        + sum(precision_violations.values()),
+    }
 
 
 def _cols(conn, table):
@@ -202,6 +581,88 @@ def migrate(conn):
     conn.execute(
         "INSERT OR IGNORE INTO risk_settings(account) SELECT name FROM accounts"
     )
+    _normalize_storage(conn)
+    invariants = _database_invariants(conn)
+    if invariants["total"]:
+        raise RuntimeError(
+            f"database migration blocked by {invariants['total']} logical violation(s)"
+        )
+    _install_data_guards(conn)
+
+
+def _normalize_storage(conn):
+    """Normalize persisted numeric values to their documented fixed precision."""
+    specifications = (
+        (
+            "accounts",
+            ("name",),
+            (("cash", _money), ("deposits", _money), ("realized", _money)),
+        ),
+        (
+            "positions",
+            ("account", "symbol"),
+            (
+                ("qty", _quantity),
+                ("avg_cost", _price),
+                ("mult", _quantity),
+                ("margin", _money),
+            ),
+        ),
+        (
+            "orders",
+            ("id",),
+            (
+                ("qty", _quantity),
+                ("limit_price", _price),
+                ("filled_price", _price),
+                ("stop_price", _price),
+                ("trail_price", _price),
+                ("trail_percent", _quantity),
+                ("hwm", _price),
+                ("notional", _money),
+            ),
+        ),
+        ("cashflow", ("id",), (("amount", _money),)),
+        (
+            "risk_settings",
+            ("account",),
+            (
+                ("max_gross_leverage", _quantity),
+                ("max_order_notional", _money),
+            ),
+        ),
+        (
+            "corporate_actions",
+            ("id",),
+            (("value", _quantity), ("cash_effect", _money)),
+        ),
+        (
+            "option_instructions",
+            ("account", "symbol"),
+            (("qty", _quantity),),
+        ),
+    )
+    try:
+        for table, keys, fields in specifications:
+            names = keys + tuple(name for name, _ in fields)
+            rows = conn.execute(f"SELECT {','.join(names)} FROM {table}").fetchall()
+            assignments = ",".join(f"{name}=?" for name, _ in fields)
+            predicate = " AND ".join(f"{key}=?" for key in keys)
+            normalized = []
+            for row in rows:
+                values = row[len(keys) :]
+                converted = [
+                    converter(value) if value is not None else None
+                    for value, (_, converter) in zip(values, fields)
+                ]
+                normalized.append((*converted, *row[: len(keys)]))
+            if normalized:
+                conn.executemany(
+                    f"UPDATE {table} SET {assignments} WHERE {predicate}",
+                    normalized,
+                )
+    except SystemExit as exc:
+        raise RuntimeError(f"database contains an invalid numeric value: {exc}") from exc
 
 
 def _database_file_path():
@@ -222,6 +683,27 @@ def _secure_database_files(path):
             continue
 
 
+def _migration_backup(conn, path, from_version):
+    """Create a private, consistent backup before changing an existing schema."""
+    directory = f"{path}.migrations"
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    os.chmod(directory, 0o700)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    descriptor, backup_path = tempfile.mkstemp(
+        prefix=f"pre-v{from_version}-to-v{SCHEMA_VERSION}-{stamp}-",
+        suffix=".db",
+        dir=directory,
+    )
+    os.close(descriptor)
+    os.chmod(backup_path, 0o600)
+    target = sqlite3.connect(backup_path)
+    try:
+        conn.backup(target)
+    finally:
+        target.close()
+    return backup_path
+
+
 def db():
     # WAL + busy_timeout + autocommit so multiple agents (Codex, Claude Code, Hermes) share the DB.
     # Mutations must run inside writing() so BEGIN IMMEDIATE serializes read-modify-write.
@@ -233,18 +715,43 @@ def db():
         os.close(descriptor)
         _secure_database_files(path)
     conn = sqlite3.connect(DB, timeout=10, isolation_level=None)
-    conn.execute("PRAGMA busy_timeout=10000")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    _secure_database_files(path)
-    conn.executescript(SCHEMA)
-    if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
-        with writing(conn):
-            # Another process may have completed this while we waited for the lock.
-            if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
-                migrate(conn)
-                conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-    return conn
+    try:
+        conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        _secure_database_files(path)
+        current_version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if current_version > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"database schema v{current_version} is newer than supported"
+                f" v{SCHEMA_VERSION}; upgrade tradingcli"
+            )
+        had_schema = bool(
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='accounts'"
+            ).fetchone()
+        )
+        backup_path = None
+        if current_version < SCHEMA_VERSION and had_schema and path is not None:
+            backup_path = _migration_backup(conn, path, current_version)
+        conn.executescript(SCHEMA)
+        if current_version < SCHEMA_VERSION:
+            with writing(conn):
+                # Another process may have completed this while we waited for the lock.
+                if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+                    migrate(conn)
+                    if backup_path:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO config(key,value) VALUES(?,?)",
+                            ("last_migration_backup", backup_path),
+                        )
+                    conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        _install_data_guards(conn)
+        return conn
+    except BaseException:
+        conn.close()
+        raise
 
 
 @contextlib.contextmanager
@@ -369,6 +876,10 @@ def set_risk_limits(
         not math.isfinite(max_order_notional) or max_order_notional <= 0
     ):
         raise SystemExit("max order notional must be a positive finite number")
+    if max_order_notional is not None:
+        max_order_notional = _money(max_order_notional)
+    if max_gross_leverage is not None:
+        max_gross_leverage = _quantity(max_gross_leverage)
     with writing(conn):
         if _idempotent_action(conn, "risk.set", account, source, request_id, details):
             print(f"idempotent replay: risk settings for {account}")
@@ -542,14 +1053,16 @@ def _apply(state, symbol, side, qty, price):
     Shared by the DB fill() and the equity-curve replay so the money math is identical."""
     if side not in ("buy", "sell"):
         raise SystemExit("side must be buy or sell")
+    qty = _quantity(qty)
+    price = _price(price)
     ac, mult, margin_per = classify(symbol)
-    cash = state["cash"]
+    cash = _money(state["cash"])
     p = state["pos"].get(symbol)
     old_qty, old_avg, old_margin = (
         (p["qty"], p["avg"], p["margin"]) if p else (0.0, 0.0, 0.0)
     )
     signed = qty if side == "buy" else -qty
-    new_qty = old_qty + signed
+    new_qty = _quantity(old_qty + signed)
     realized = new_margin = 0.0
 
     if ac == "future":
@@ -596,17 +1109,17 @@ def _apply(state, symbol, side, qty, price):
             new_avg = old_avg if new_qty != 0 else 0.0
         cash -= cost
 
-    state["cash"] = cash
-    state["realized"] += realized
+    state["cash"] = _money(cash)
+    state["realized"] = _money(state["realized"] + realized)
     if abs(new_qty) < 1e-9:
         state["pos"].pop(symbol, None)
     else:
         state["pos"][symbol] = {
-            "qty": new_qty,
-            "avg": new_avg,
+            "qty": _quantity(new_qty),
+            "avg": _price(new_avg),
             "mult": mult,
             "ac": ac,
-            "margin": new_margin,
+            "margin": _money(new_margin),
         }
 
 
@@ -795,9 +1308,12 @@ def _fill_locked(conn, account, symbol, side, qty, price, enforce_risk=True):
         conn.execute(
             "DELETE FROM positions WHERE account=? AND symbol=?", (account, symbol)
         )
+    current_realized = conn.execute(
+        "SELECT realized FROM accounts WHERE name=?", (account,)
+    ).fetchone()[0]
     conn.execute(
-        "UPDATE accounts SET cash=?, realized=realized+? WHERE name=?",
-        (state["cash"], state["realized"], account),
+        "UPDATE accounts SET cash=?, realized=? WHERE name=?",
+        (state["cash"], _money(current_realized + state["realized"]), account),
     )
     return report
 
@@ -923,6 +1439,14 @@ def _insert_order_locked(
     triggered=False,
 ):
     order_type = order_type or ("limit" if limit is not None else "market")
+    qty = _quantity(qty)
+    limit = _price(limit) if limit is not None else None
+    filled_price = _price(filled_price) if filled_price is not None else None
+    stop_price = _price(stop_price) if stop_price is not None else None
+    trail_price = _price(trail_price) if trail_price is not None else None
+    trail_percent = _quantity(trail_percent) if trail_percent is not None else None
+    hwm = _price(hwm) if hwm is not None else None
+    notional = _money(notional) if notional is not None else None
     cur = conn.execute(
         "INSERT INTO orders(account,symbol,side,qty,limit_price,status,filled_price,ts,"
         "source,request_id,reject_reason,order_type,stop_price,trail_price,trail_percent,"
@@ -2290,6 +2814,9 @@ def adjust_cash(conn, account, amount, source="cli", request_id=None):
     """Positive = deposit, negative = withdraw. Changes contributed capital, not P&L."""
     if not math.isfinite(amount) or amount == 0:
         raise SystemExit("cash adjustment must be a non-zero finite number")
+    amount = _money(amount)
+    if amount == 0:
+        raise SystemExit("cash adjustment rounds to zero at cent precision")
     source, request_id = _context(source, request_id)
     details = {"amount": amount}
     with writing(conn):
@@ -2299,21 +2826,22 @@ def adjust_cash(conn, account, amount, source="cli", request_id=None):
             print(f"idempotent replay: cash adjustment {amount:+,.2f} for {account}")
             return
         row = conn.execute(
-            "SELECT cash FROM accounts WHERE name=?", (account,)
+            "SELECT cash,deposits FROM accounts WHERE name=?", (account,)
         ).fetchone()
         if not row:
             raise SystemExit(f"no account '{account}'")
         if amount < 0 and row[0] + amount < 0:
             raise SystemExit(f"insufficient cash: have {row[0]:,.2f}")
+        new_cash = _money(row[0] + amount)
+        new_deposits = _money(row[1] + amount)
         conn.execute(
-            "UPDATE accounts SET cash=cash+?, deposits=deposits+? WHERE name=?",
-            (amount, amount, account),
+            "UPDATE accounts SET cash=?, deposits=? WHERE name=?",
+            (new_cash, new_deposits, account),
         )
         conn.execute(
             "INSERT INTO cashflow(account, ts, amount) VALUES(?,?,?)",
             (account, datetime.now(timezone.utc).isoformat(timespec="seconds"), amount),
         )
-        new_cash = row[0] + amount
         _audit_locked(conn, "cash.adjust", account, source, request_id, details)
     verb = "deposited" if amount >= 0 else "withdrew"
     print(f"{verb} {abs(amount):,.2f} — cash now {new_cash:,.2f}")
@@ -2333,6 +2861,7 @@ def create_account(
         raise SystemExit("name required")
     if not math.isfinite(cash) or cash < 0:
         raise SystemExit("starting cash must be a non-negative finite number")
+    cash = _money(cash)
     source, request_id = _context(source, request_id)
     details = {"cash": cash, "make_default": bool(make_default)}
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -2379,8 +2908,12 @@ def rename_account(conn, old, new, source="cli", request_id=None):
             raise SystemExit(f"no account '{old}'")
         if conn.execute("SELECT 1 FROM accounts WHERE name=?", (new,)).fetchone():
             raise SystemExit(f"'{new}' already exists")
+        conn.execute(
+            "INSERT INTO accounts(name,cash,deposits,realized,created)"
+            " SELECT ?,cash,deposits,realized,created FROM accounts WHERE name=?",
+            (new, old),
+        )
         for tbl, col in [
-            ("accounts", "name"),
             ("positions", "account"),
             ("orders", "account"),
             ("cashflow", "account"),
@@ -2391,6 +2924,7 @@ def rename_account(conn, old, new, source="cli", request_id=None):
             ("option_instructions", "account"),
         ]:
             conn.execute(f"UPDATE {tbl} SET {col}=? WHERE {col}=?", (new, old))
+        conn.execute("DELETE FROM accounts WHERE name=?", (old,))
         conn.execute(
             "UPDATE config SET value=? WHERE key='default_account' AND value=?",
             (new, old),
@@ -2403,6 +2937,8 @@ def wipe_account(conn, name, reset_cash=None, source="cli", request_id=None):
     """reset_cash=None deletes the account; a number resets balances and clears history."""
     if reset_cash is not None and (not math.isfinite(reset_cash) or reset_cash < 0):
         raise SystemExit("reset cash must be a non-negative finite number")
+    if reset_cash is not None:
+        reset_cash = _money(reset_cash)
     source, request_id = _context(source, request_id)
     action = "account.delete" if reset_cash is None else "account.reset"
     details = {"reset_cash": reset_cash}
@@ -2424,12 +2960,12 @@ def wipe_account(conn, name, reset_cash=None, source="cli", request_id=None):
         )
         conn.execute("DELETE FROM watchlists WHERE account=?", (name,))
         if reset_cash is None:
-            conn.execute("DELETE FROM accounts WHERE name=?", (name,))
             conn.execute("DELETE FROM cashflow WHERE account=?", (name,))
+            conn.execute("DELETE FROM risk_settings WHERE account=?", (name,))
+            conn.execute("DELETE FROM accounts WHERE name=?", (name,))
             conn.execute(
                 "DELETE FROM config WHERE key='default_account' AND value=?", (name,)
             )
-            conn.execute("DELETE FROM risk_settings WHERE account=?", (name,))
             has_default = conn.execute(
                 "SELECT 1 FROM config WHERE key='default_account'"
             ).fetchone()
@@ -2667,8 +3203,10 @@ def tick(conn, price_fn=live_price):
                     "UPDATE orders SET hwm=COALESCE(?,hwm),stop_price=COALESCE(?,stop_price),"
                     "triggered=COALESCE(?,triggered) WHERE id=? AND status='pending'",
                     (
-                        updates.get("hwm"),
-                        updates.get("stop_price"),
+                        _price(updates["hwm"]) if updates.get("hwm") is not None else None,
+                        _price(updates["stop_price"])
+                        if updates.get("stop_price") is not None
+                        else None,
                         updates.get("triggered"),
                         oid,
                     ),
@@ -2703,7 +3241,7 @@ def tick(conn, price_fn=live_price):
                 continue
             conn.execute(
                 "UPDATE orders SET status='filled',filled_price=? WHERE id=? AND status='pending'",
-                (price, oid),
+                (_price(price), oid),
             )
             _linked_after_fill_locked(conn, current)
             _audit_locked(
@@ -2832,17 +3370,36 @@ def sync_corporate_actions(
                     continue
                 cash_effect = 0.0
                 if kind == "split":
-                    conn.execute(
-                        "UPDATE positions SET qty=qty*?,avg_cost=avg_cost/?"
+                    position = conn.execute(
+                        "SELECT qty,avg_cost FROM positions"
                         " WHERE account=? AND symbol=?",
-                        (value, value, name, symbol),
+                        (name, symbol),
+                    ).fetchone()
+                    if not position:
+                        continue
+                    conn.execute(
+                        "UPDATE positions SET qty=?,avg_cost=?"
+                        " WHERE account=? AND symbol=?",
+                        (
+                            _quantity(position[0] * value),
+                            _price(position[1] / value),
+                            name,
+                            symbol,
+                        ),
                     )
                 elif kind == "dividend":
                     qty = _position_qty_before(conn, name, symbol, action_date)
-                    cash_effect = qty * value
+                    cash_effect = _money(qty * value)
+                    balances = conn.execute(
+                        "SELECT cash,realized FROM accounts WHERE name=?", (name,)
+                    ).fetchone()
                     conn.execute(
-                        "UPDATE accounts SET cash=cash+?,realized=realized+? WHERE name=?",
-                        (cash_effect, cash_effect, name),
+                        "UPDATE accounts SET cash=?,realized=? WHERE name=?",
+                        (
+                            _money(balances[0] + cash_effect),
+                            _money(balances[1] + cash_effect),
+                            name,
+                        ),
                     )
                 else:
                     continue
@@ -3440,13 +3997,33 @@ def backup_database(conn, directory=None):
 def healthcheck(conn):
     integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
     schema_version = conn.execute("PRAGMA user_version").fetchone()[0]
-    healthy = integrity == "ok" and schema_version == SCHEMA_VERSION
+    logical = _database_invariants(conn)
+    foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+    guard_count = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master"
+        " WHERE type='trigger' AND name LIKE 'guard_%'"
+    ).fetchone()[0]
+    backup = conn.execute(
+        "SELECT value FROM config WHERE key='last_migration_backup'"
+    ).fetchone()
+    healthy = (
+        integrity == "ok"
+        and schema_version == SCHEMA_VERSION
+        and logical["total"] == 0
+        and bool(foreign_keys)
+        and guard_count > 0
+    )
     return {
         "status": "ok" if healthy else "degraded",
         "integrity": integrity,
+        "logical_integrity": logical,
+        "foreign_keys": bool(foreign_keys),
+        "data_guards": guard_count,
+        "fixed_precision": {"money": 2, "price": 6, "quantity": 8},
         "journal_mode": conn.execute("PRAGMA journal_mode").fetchone()[0],
         "schema_version": schema_version,
         "expected_schema_version": SCHEMA_VERSION,
+        "last_migration_backup": os.path.basename(backup[0]) if backup else None,
         "accounts": conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0],
         "positions": conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0],
         "pending_orders": conn.execute(

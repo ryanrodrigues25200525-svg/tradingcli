@@ -4,7 +4,7 @@ A local, multi-account paper-trading CLI, live terminal dashboard, and MCP
 server. It stores portfolio state in SQLite and uses Yahoo Finance market data.
 
 Supported instruments include equities, ETFs, crypto, foreign exchange,
-futures, and equity options. The schema-v3 engine also supports stop,
+futures, and equity options. The schema-v4 engine also supports stop,
 stop-limit, trailing-stop, bracket, OCO, OTO, and multi-leg option orders.
 This is a simulation tool and does not place live brokerage orders.
 
@@ -120,7 +120,8 @@ investment advice.
 
 Every command accepts one automation output flag: `--json`, `--csv`, or
 `--quiet`. `--schema` returns the command tree without accessing market data,
-and `doctor` checks database integrity and schema health.
+and `doctor` checks physical integrity, logical relationships, fixed-precision
+storage, schema compatibility, and active database guards.
 
 Start the MCP server over standard input/output:
 
@@ -158,6 +159,18 @@ forced to owner-only `0600`; the backup directory is `0700` and backups are
 `0600`. Set `PAPERTRADE_DB` to use a different database path. Set
 `PAPERTRADE_MARKET_TIMEOUT` to change the default 15-second timeout used by
 historical-data requests.
+
+Schema v4 normalizes money to 2 decimal places, prices to 6, and quantities to
+8 using decimal half-even rounding. SQLite guards reject invalid domains,
+orphaned account/watchlist records, and values outside those precision
+contracts—even when a caller bypasses the CLI.
+
+Opening an older on-disk database upgrades it automatically. Before any
+upgrade, TradingCLI writes a transactionally consistent snapshot beside the
+database in `<database>.migrations/`; both the directory and snapshot remain
+owner-only. A failed validation rolls back the migration and leaves the prior
+schema version and data intact. Databases created by a newer TradingCLI release
+are refused instead of being modified.
 
 Yahoo Finance supplies the market data. Its historical quote/trade series and
 crypto top-of-book output are explicitly marked aggregated or indicative;

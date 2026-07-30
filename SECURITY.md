@@ -16,6 +16,8 @@ TradingCLI stores simulated account, order, position, watchlist, and audit data
 in `~/.papertrade.db` by default. The application enforces owner-only `0600`
 permissions on the database and SQLite sidecars. Backups are stored in
 `~/.papertrade_backups`, with a `0700` directory and `0600` files.
+Automatic pre-migration snapshots are stored in
+`~/.papertrade.db.migrations` with the same owner-only permissions.
 
 Anyone able to run the CLI or MCP server as the same operating-system user can
 access this data. The stdio MCP server is not an authenticated network service
