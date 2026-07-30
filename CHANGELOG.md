@@ -16,6 +16,8 @@ All notable changes are documented here.
 - File-backed deterministic price provider for repeatable simulations.
 - Scheduler actions for quote warming, alert checks, and simulation reports.
 - Offline-first dashboard marks loaded from SQLite before network refresh.
+- Public-release documentation with demo-only CLI screenshots, feature matrix,
+  environment reference, safety guidance, and contributor links.
 
 ### Changed
 

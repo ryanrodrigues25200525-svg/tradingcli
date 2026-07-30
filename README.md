@@ -1,14 +1,61 @@
-# tradingcli
+<div align="center">
 
-A local, multi-account paper-trading CLI, live terminal dashboard, and MCP
-server. It stores portfolio state in SQLite and uses Yahoo Finance market data.
+# 📈 TradingCLI
 
-Supported instruments include equities, ETFs, crypto, foreign exchange,
-futures, and equity options. The schema-v6 engine also supports stop,
-stop-limit, trailing-stop, bracket, OCO, OTO, and multi-leg option orders.
-This is a simulation tool and does not place live brokerage orders.
+**A fast, local-first paper-trading and market-simulation toolkit for your terminal.**
 
-## Scope and safety
+[![CI](https://github.com/ryanrodrigues25200525-svg/tradingcli/actions/workflows/ci.yml/badge.svg)](https://github.com/ryanrodrigues25200525-svg/tradingcli/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/Python-3.10–3.13-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-MIT-45d483.svg)](LICENSE)
+[![Scope](https://img.shields.io/badge/Trading-paper%20only-ff355d.svg)](#scope-and-safety)
+[![SQLite](https://img.shields.io/badge/Storage-SQLite-7dd3fc?logo=sqlite&logoColor=white)](https://sqlite.org/)
+
+Multi-account portfolios · advanced simulated orders · options and futures ·
+terminal dashboard · backtesting · alerts · automation · MCP
+
+</div>
+
+> [!IMPORTANT]
+> TradingCLI is strictly a **local paper-trading simulator**. It never routes
+> orders to a live broker and is not a source of personalized financial advice.
+
+## 🖥️ Screenshots
+
+| Paper-trading workflow | Offline report and benchmark |
+| --- | --- |
+| ![TradingCLI quickstart terminal](docs/images/cli-quickstart.svg) | ![TradingCLI simulation report and benchmark](docs/images/cli-report.svg) |
+
+The captures use a disposable demo database and deterministic static prices;
+they contain no real portfolio or credential data.
+
+## ✨ Highlights
+
+| Area | What is included |
+| --- | --- |
+| ⚡ Fast terminal UX | Roughly 20 ms median installed startup, persistent quote cache, offline-first dashboard |
+| 💼 Portfolio simulation | Multiple accounts, deposits, withdrawals, P&L, time-weighted returns and reconciliation |
+| 🧾 Advanced orders | Market, limit, stop, stop-limit, trailing, bracket, OCO, OTO and multi-leg options |
+| 🌍 Instruments | Equities, ETFs, crypto, FX, futures and equity options |
+| 🧪 Research | Current-holdings backtests, walk-forward SMA tests, portfolio optimization and performance metrics |
+| 🔔 Local operations | Alerts, JSONL notifications, reports, quote streaming, scheduling, backups and encrypted copies |
+| 🤖 Agent ready | Local stdio MCP server with core, advanced and compatibility profiles |
+| 🛡️ Durable storage | SQLite WAL, fixed precision, 56 data guards, migration backups and owner-only permissions |
+
+## 🧭 Contents
+
+- [Scope and safety](#scope-and-safety)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Dashboard and research](#dashboard-and-research)
+- [Orders, options and market data](#orders-options-and-market-data)
+- [Operations and simulation lab](#operations-and-simulation-lab)
+- [MCP server](#mcp-server)
+- [Configuration](#configuration)
+- [Development and verification](#development-and-verification)
+
+<a id="scope-and-safety"></a>
+
+## 🛡️ Scope and safety
 
 TradingCLI is a local paper-trading simulator. It never places live brokerage
 orders, and its Yahoo Finance data is not an exchange-grade feed. Do not use it
@@ -19,7 +66,9 @@ Fetching prices, news, history, and option chains sends held, pending, or
 watchlisted symbols to Yahoo Finance through `yfinance`. See
 [SECURITY.md](SECURITY.md) for the local-data and network privacy model.
 
-## Install
+<a id="install"></a>
+
+## 📦 Install
 
 Requires Python 3.10 or newer.
 
@@ -41,7 +90,9 @@ uv run python run_tests.py
 `uv` workflow for CI and repeatable deployments; the plain `pip` install above
 is the lightweight end-user path.
 
-## Run
+<a id="quick-start"></a>
+
+## 🚀 Quick start
 
 Launch the dashboard and first-run setup wizard:
 
@@ -58,6 +109,17 @@ tradingcli positions
 tradingcli market
 tradingcli backtest --lookback-days 3650
 ```
+
+Inspect all command families without touching market data:
+
+```bash
+tradingcli --help-all
+tradingcli --schema
+```
+
+<a id="dashboard-and-research"></a>
+
+## 📊 Dashboard and research
 
 Press `g` in the dashboard to open **Backtesting & Graphs**. It shows the
 selected portfolio's live performance curve beside a `backtesting.py`
@@ -80,17 +142,21 @@ Current-performance returns are time-weighted, so deposits and withdrawals do
 not masquerade as trading gains or losses. Live marks and historical symbols
 load concurrently, and the graph/backtest pair reuses overlapping history.
 
+<a id="orders-options-and-market-data"></a>
+
+## 🧾 Orders, options and market data
+
 Alpaca-style order lifecycle:
 
 ```bash
-python3 papertrade.py order submit AAPL --side buy --qty 10 --type limit --limit-price 185
-python3 papertrade.py order submit AAPL --side sell --qty 10 --type trailing-stop --trail-percent 3
-python3 papertrade.py order get --order-id 1
-python3 papertrade.py order replace 1 --limit-price 184
-python3 papertrade.py order cancel-all
-python3 papertrade.py order submit AAPL --side buy --qty 10 --type limit --limit-price 180 --dry-run
-python3 papertrade.py position close AAPL --percent 50
-python3 papertrade.py position close-all
+tradingcli order submit AAPL --side buy --qty 10 --type limit --limit-price 185
+tradingcli order submit AAPL --side sell --qty 10 --type trailing-stop --trail-percent 3
+tradingcli order get --order-id 1
+tradingcli order replace 1 --limit-price 184
+tradingcli order cancel-all
+tradingcli order submit AAPL --side buy --qty 10 --type limit --limit-price 180 --dry-run
+tradingcli position close AAPL --percent 50
+tradingcli position close-all
 ```
 
 Bracket, OCO, and OTO exits use `--take-profit`, `--stop-loss`, and optionally
@@ -100,15 +166,15 @@ IDs, time-in-force values, and eligible extended-hours limit orders.
 Options, watchlists, and research:
 
 ```bash
-python3 papertrade.py option get AAPL270115C00100000
-python3 papertrade.py option exercise AAPL270115C00100000
-python3 papertrade.py option do-not-exercise AAPL270115C00100000
-python3 papertrade.py watchlist create Tech --symbols AAPL,MSFT,NVDA
-python3 papertrade.py watchlist quotes Tech
-python3 papertrade.py calendar --start 2026-07-01 --end 2026-07-31
-python3 papertrade.py data bars AAPL --timeframe 1Day --limit 30
-python3 papertrade.py data snapshot AAPL
-python3 papertrade.py data movers
+tradingcli option get AAPL270115C00100000
+tradingcli option exercise AAPL270115C00100000
+tradingcli option do-not-exercise AAPL270115C00100000
+tradingcli watchlist create Tech --symbols AAPL,MSFT,NVDA
+tradingcli watchlist quotes Tech
+tradingcli calendar --start 2026-07-01 --end 2026-07-31
+tradingcli data bars AAPL --timeframe 1Day --limit 30
+tradingcli data snapshot AAPL
+tradingcli data movers
 ```
 
 Portfolio rebalance suggestions are available through the MCP
@@ -118,10 +184,12 @@ and options. When anything is skipped, the response is marked `ok_partial` and
 defines its weight scope explicitly. It is model output—not personalized
 investment advice.
 
-## Operational platform
+<a id="operations-and-simulation-lab"></a>
 
-Version 0.4 adds an append-only double-entry ledger alongside the portfolio
-projection. Funding, fills, commissions, and schema-v5 opening balances are
+## 🧰 Operations and simulation lab
+
+An append-only double-entry ledger sits alongside the portfolio projection.
+Funding, fills, commissions, and migrated opening balances are
 balanced transactions; reconciliation can report or repair drift:
 
 ```bash
@@ -228,6 +296,10 @@ Every command accepts one automation output flag: `--json`, `--csv`, or
 and `doctor` checks physical integrity, logical relationships, fixed-precision
 storage, schema compatibility, and active database guards.
 
+<a id="mcp-server"></a>
+
+## 🤖 MCP server
+
 Start the MCP server over standard input/output:
 
 ```bash
@@ -265,6 +337,23 @@ forced to owner-only `0600`; the backup directory is `0700` and backups are
 `PAPERTRADE_MARKET_TIMEOUT` to change the default 15-second timeout used by
 historical-data requests.
 
+<a id="configuration"></a>
+
+## ⚙️ Configuration
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `PAPERTRADE_DB` | SQLite portfolio path | `~/.papertrade.db` |
+| `PAPERTRADE_MARKET_TIMEOUT` | Historical request timeout | `15` seconds |
+| `PAPERTRADE_PRICE_CACHE_TTL` | Cross-process price cache life | `15` seconds |
+| `PAPERTRADE_PRICE_PROVIDERS` | Ordered `file`, `static`, `yahoo` provider chain | `static,yahoo` |
+| `PAPERTRADE_PRICE_FILE` | Deterministic local JSON price map | unset |
+| `PAPERTRADE_STATIC_PRICES` | Inline JSON price map | `{}` |
+| `PAPERTRADE_NOTIFICATION_FILE` | Alert notification JSONL inbox | `~/.papertrade_notifications.jsonl` |
+| `PAPERTRADE_API_TOKEN` | Loopback API bearer token | unset |
+| `PAPERTRADE_ENCRYPTION_PASSWORD` | Password used for encrypted copies | unset |
+| `PAPERTRADE_MCP_PROFILE` | MCP catalog: `core`, `advanced`, `full` | `core` |
+
 Schema v6 normalizes money to 2 decimal places, prices to 6, and quantities to
 8 using decimal half-even rounding. SQLite guards reject invalid domains,
 orphaned account/watchlist records, and values outside those precision
@@ -281,7 +370,9 @@ Yahoo Finance supplies the market data. Its historical quote/trade series and
 crypto top-of-book output are explicitly marked aggregated or indicative;
 Yahoo does not expose exchange tick tapes or full order-book depth.
 
-## Verify
+<a id="development-and-verification"></a>
+
+## 🧑‍💻 Development and verification
 
 Run the isolated contract suite:
 
@@ -294,3 +385,10 @@ python3 -m build
 The runner discovers every `test_*.py` contract and executes each one in an
 isolated subprocess and temporary database. GitHub Actions runs the same checks
 on Python 3.10 and 3.13.
+
+Contributions are welcome—see [CONTRIBUTING.md](CONTRIBUTING.md). Security
+reports should follow [SECURITY.md](SECURITY.md), not a public issue.
+
+## 📄 License
+
+Released under the [MIT License](LICENSE).

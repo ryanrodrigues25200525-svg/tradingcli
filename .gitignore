@@ -8,6 +8,8 @@ __pycache__/
 # Virtual environments and local configuration
 .venv/
 venv/
+.idea/
+.vscode/
 .env
 .env.*
 !.env.example
@@ -15,8 +17,11 @@ venv/
 # Local portfolio state and SQLite sidecars
 .papertrade.db*
 *.db
+*.sqlite
+*.sqlite3
 *.db-shm
 *.db-wal
+*.jsonl
 
 # Build and coverage artifacts
 build/
@@ -24,3 +29,8 @@ dist/
 *.egg-info/
 .coverage*
 htmlcov/
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp

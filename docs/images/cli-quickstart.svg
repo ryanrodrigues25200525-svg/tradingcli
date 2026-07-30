@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720" role="img" aria-labelledby="title desc">
+  <title id="title">TradingCLI quickstart terminal</title>
+  <desc id="desc">A demo account buys AAPL and MSFT, warms the local quote cache, and creates a price alert.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#090d18"/>
+      <stop offset="1" stop-color="#111a2e"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="18" stdDeviation="20" flood-color="#000" flood-opacity=".45"/>
+    </filter>
+  </defs>
+  <rect width="1200" height="720" fill="#070a12"/>
+  <circle cx="1040" cy="30" r="260" fill="#ff355d" opacity=".09"/>
+  <circle cx="80" cy="690" r="250" fill="#45d483" opacity=".08"/>
+  <g filter="url(#shadow)">
+    <rect x="55" y="42" width="1090" height="630" rx="18" fill="url(#background)" stroke="#26324d"/>
+    <rect x="55" y="42" width="1090" height="52" rx="18" fill="#171d2b"/>
+    <rect x="55" y="76" width="1090" height="18" fill="#171d2b"/>
+  </g>
+  <circle cx="88" cy="68" r="7" fill="#ff5f57"/>
+  <circle cx="112" cy="68" r="7" fill="#febc2e"/>
+  <circle cx="136" cy="68" r="7" fill="#28c840"/>
+  <text x="600" y="74" text-anchor="middle" fill="#a9b4ca" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="15">tradingcli — local paper trading</text>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20">
+    <text x="88" y="138" fill="#45d483">❯</text>
+    <text x="118" y="138" fill="#e8edf7">tradingcli new demo-growth --cash 100000</text>
+    <text x="88" y="174" fill="#94a3b8">created 'demo-growth' with 100,000.00 (set as default)</text>
+
+    <text x="88" y="226" fill="#45d483">❯</text>
+    <text x="118" y="226" fill="#e8edf7">tradingcli buy AAPL 25</text>
+    <text x="88" y="262" fill="#7dd3fc">filled #1 buy 25 AAPL @ 225.40</text>
+
+    <text x="88" y="314" fill="#45d483">❯</text>
+    <text x="118" y="314" fill="#e8edf7">tradingcli buy MSFT 10</text>
+    <text x="88" y="350" fill="#7dd3fc">filled #2 buy 10 MSFT @ 418.75</text>
+
+    <text x="88" y="402" fill="#45d483">❯</text>
+    <text x="118" y="402" fill="#e8edf7">tradingcli quotes warm AAPL MSFT</text>
+    <text x="88" y="438" fill="#94a3b8">{</text>
+    <text x="116" y="474" fill="#c4b5fd">"requested"</text><text x="258" y="474" fill="#94a3b8">: 2,</text>
+    <text x="116" y="510" fill="#c4b5fd">"updated"</text><text x="246" y="510" fill="#94a3b8">: 2,</text>
+    <text x="116" y="546" fill="#c4b5fd">"quotes"</text><text x="234" y="546" fill="#94a3b8">: {</text>
+    <text x="156" y="582" fill="#f9a8d4">"AAPL"</text><text x="246" y="582" fill="#94a3b8">: 225.40,</text>
+    <text x="156" y="618" fill="#f9a8d4">"MSFT"</text><text x="246" y="618" fill="#94a3b8">: 418.75</text>
+    <text x="88" y="654" fill="#94a3b8">}}</text>
+  </g>
+  <g transform="translate(650 410)">
+    <rect width="440" height="178" rx="13" fill="#121a2a" stroke="#33405d"/>
+    <text x="24" y="42" fill="#ff7190" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="17">LOCAL ALERT</text>
+    <text x="24" y="82" fill="#e8edf7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18">AAPL breakout above 230</text>
+    <text x="24" y="120" fill="#94a3b8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16">SQLite event history · cooldowns</text>
+    <text x="24" y="150" fill="#45d483" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16">✓ no broker connection</text>
+  </g>
+</svg>

@@ -35,6 +35,12 @@ dependencies = [
   "yfinance>=1,<2",
 ]
 
+[project.urls]
+Homepage = "https://github.com/ryanrodrigues25200525-svg/tradingcli"
+Repository = "https://github.com/ryanrodrigues25200525-svg/tradingcli.git"
+Issues = "https://github.com/ryanrodrigues25200525-svg/tradingcli/issues"
+Changelog = "https://github.com/ryanrodrigues25200525-svg/tradingcli/blob/main/CHANGELOG.md"
+
 [project.optional-dependencies]
 dev = [
   "build>=1.2,<2",
