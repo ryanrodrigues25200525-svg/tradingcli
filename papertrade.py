@@ -27,6 +27,10 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 
 DB = os.environ.get("PAPERTRADE_DB", os.path.expanduser("~/.papertrade.db"))
+VERSION = "0.2.0"
+MARKET_DATA_TIMEOUT = max(
+    1.0, float(os.environ.get("PAPERTRADE_MARKET_TIMEOUT", "15"))
+)
 
 # future symbol -> (contract multiplier, initial margin per contract)
 FUTURES = {
@@ -200,13 +204,39 @@ def migrate(conn):
     )
 
 
+def _database_file_path():
+    """Return the concrete SQLite path, or None for memory/URI databases."""
+    if DB == ":memory:" or DB.startswith("file:"):
+        return None
+    return os.path.abspath(os.path.expanduser(DB))
+
+
+def _secure_database_files(path):
+    """Ensure portfolio state and SQLite sidecars are private to the owner."""
+    if path is None:
+        return
+    for candidate in (path, f"{path}-wal", f"{path}-shm"):
+        try:
+            os.chmod(candidate, 0o600)
+        except FileNotFoundError:
+            continue
+
+
 def db():
     # WAL + busy_timeout + autocommit so multiple agents (Codex, Claude Code, Hermes) share the DB.
     # Mutations must run inside writing() so BEGIN IMMEDIATE serializes read-modify-write.
+    path = _database_file_path()
+    if path is not None:
+        # sqlite3.connect() otherwise creates files from the process umask,
+        # commonly exposing portfolio state as world-readable mode 0644.
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        os.close(descriptor)
+        _secure_database_files(path)
     conn = sqlite3.connect(DB, timeout=10, isolation_level=None)
     conn.execute("PRAGMA busy_timeout=10000")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    _secure_database_files(path)
     conn.executescript(SCHEMA)
     if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
         with writing(conn):
@@ -2698,7 +2728,11 @@ def _fetch_corporate_actions(symbol, start, end):
     import yfinance as yf
 
     history = yf.Ticker(symbol).history(
-        start=start, end=end, actions=True, auto_adjust=False
+        start=start,
+        end=end,
+        actions=True,
+        auto_adjust=False,
+        timeout=MARKET_DATA_TIMEOUT,
     )
     actions = []
     for stamp, row in history.iterrows():
@@ -3096,7 +3130,9 @@ def market_history(
     if not start and not end:
         kwargs["period"] = "1mo" if interval in ("1d", "1wk", "1mo") else "5d"
     try:
-        frame = yf.Ticker(symbol).history(**kwargs).tail(limit)
+        frame = yf.Ticker(symbol).history(
+            **kwargs, timeout=MARKET_DATA_TIMEOUT
+        ).tail(limit)
     except Exception as exc:
         raise SystemExit(f"market history failed: {exc}") from None
     rows = []
@@ -3376,12 +3412,14 @@ def account_activities(
 
 def backup_database(conn, directory=None):
     directory = directory or os.path.expanduser("~/.papertrade_backups")
-    os.makedirs(directory, exist_ok=True)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    os.chmod(directory, 0o700)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     descriptor, path = tempfile.mkstemp(
         prefix=f"papertrade-{stamp}-", suffix=".db", dir=directory
     )
     os.close(descriptor)
+    os.chmod(path, 0o600)
     target = sqlite3.connect(path)
     failed = False
     try:
@@ -3401,11 +3439,13 @@ def backup_database(conn, directory=None):
 
 def healthcheck(conn):
     integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+    schema_version = conn.execute("PRAGMA user_version").fetchone()[0]
+    healthy = integrity == "ok" and schema_version == SCHEMA_VERSION
     return {
-        "status": "ok" if integrity == "ok" else "degraded",
+        "status": "ok" if healthy else "degraded",
         "integrity": integrity,
         "journal_mode": conn.execute("PRAGMA journal_mode").fetchone()[0],
-        "schema_version": conn.execute("PRAGMA user_version").fetchone()[0],
+        "schema_version": schema_version,
         "expected_schema_version": SCHEMA_VERSION,
         "accounts": conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0],
         "positions": conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0],
@@ -3416,7 +3456,7 @@ def healthcheck(conn):
             "SELECT COUNT(*) FROM orders WHERE status='held'"
         ).fetchone()[0],
         "watchlists": conn.execute("SELECT COUNT(*) FROM watchlists").fetchone()[0],
-        "database": DB,
+        "database": os.path.basename(DB),
     }
 
 
@@ -3472,6 +3512,7 @@ def _daily_closes(symbols, start, end):
                 interval="1d",
                 auto_adjust=True,
                 actions=False,
+                timeout=MARKET_DATA_TIMEOUT,
             )["Close"]
             return symbol, {
                 stamp.strftime("%Y-%m-%d"): float(value)
@@ -3878,6 +3919,7 @@ def _build_parser():
         prog="tradingcli",
         epilog="Global automation flags: --json --csv --quiet --schema --help-all",
     )
+    p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     sub = p.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("new", help="create account")
     c.add_argument("name")

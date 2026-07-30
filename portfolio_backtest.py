@@ -13,6 +13,7 @@ import contextlib
 import io
 import logging
 import math
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
@@ -24,6 +25,9 @@ import pandas as pd  # noqa: E402  (silence import-time logging before pandas lo
 
 HistoryFn = Callable[[str, str, str], object]
 DEFAULT_LOOKBACK_DAYS = 5 * 365
+MARKET_DATA_TIMEOUT = max(
+    1.0, float(os.environ.get("PAPERTRADE_MARKET_TIMEOUT", "15"))
+)
 LOOKBACK_PRESETS = {
     "6m": 183,
     "1y": 365,
@@ -77,6 +81,7 @@ def _default_history(symbol, start, end):
         interval="1d",
         auto_adjust=True,
         actions=False,
+        timeout=MARKET_DATA_TIMEOUT,
     )
     return history["Close"] if "Close" in history else pd.Series(dtype=float)
 

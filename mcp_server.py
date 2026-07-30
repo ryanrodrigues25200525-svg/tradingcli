@@ -6,9 +6,11 @@ import functools
 import io
 import inspect
 import json
+import logging
 import os
 import sqlite3
 import sys
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -16,6 +18,7 @@ import papertrade as pt
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("papertrade")
+logger = logging.getLogger("tradingcli.mcp")
 
 
 def _capture(fn, *args, **kw):
@@ -287,6 +290,34 @@ def portfolio_backtest(
             end=end,
             lookback_days=lookback_days,
             commission=commission_bps / 10_000,
+        )
+        return json.dumps(result, indent=2)
+    except SystemExit as exc:
+        return f"error: {exc}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def rebalance_suggest(
+    account: str,
+    method: str = "min_variance",
+    lookback_days: int = 730,
+) -> str:
+    """Suggest target weights for an account's current long spot holdings.
+
+    method is one of: min_variance, risk_parity, equal_weight. Optimizes over
+    the account's eligible existing symbol universe only (no new tickers,
+    long-only, no leverage) using trailing daily returns. Cash is preserved;
+    options, futures, and shorts are skipped. Returns current vs target weights
+    and drift — this is a model output, not a recommendation to act on directly.
+    """
+    import portfolio_optimize as popt
+
+    conn = pt.db()
+    try:
+        result = popt.suggest_rebalance(
+            conn, account, method=method, lookback_days=lookback_days
         )
         return json.dumps(result, indent=2)
     except SystemExit as exc:
@@ -688,7 +719,7 @@ def database_backup() -> str:
     """Create a consistent online backup under ~/.papertrade_backups."""
     conn = pt.db()
     try:
-        return pt.backup_database(conn)
+        return os.path.basename(pt.backup_database(conn))
     except (OSError, sqlite3.Error) as exc:
         return f"error: backup failed: {exc}"
     finally:
@@ -1283,6 +1314,7 @@ CORE_MCP_TOOLS = frozenset(
         "pnl",
         "performance",
         "portfolio_backtest",
+        "rebalance_suggest",
         "tick",
         "asset_search",
         "validate_symbol",
@@ -1385,8 +1417,12 @@ def _wrap_json_tool(tool):
                 result = await original(*args, **kwargs)
             except SystemExit as exc:
                 return _json_error(exc)
-            except Exception as exc:
-                return _json_error(exc, "internal_error")
+            except Exception:
+                reference = uuid.uuid4().hex[:12]
+                logger.exception("MCP tool failed; reference=%s", reference)
+                return _json_error(
+                    f"internal error (reference {reference})", "internal_error"
+                )
             if isinstance(result, str) and result.strip().lower().startswith("error:"):
                 return _json_error(result.strip()[6:].strip())
             return _json_success(result)
@@ -1400,8 +1436,12 @@ def _wrap_json_tool(tool):
             result = original(*args, **kwargs)
         except SystemExit as exc:
             return _json_error(exc)
-        except Exception as exc:
-            return _json_error(exc, "internal_error")
+        except Exception:
+            reference = uuid.uuid4().hex[:12]
+            logger.exception("MCP tool failed; reference=%s", reference)
+            return _json_error(
+                f"internal error (reference {reference})", "internal_error"
+            )
         if isinstance(result, str) and result.strip().lower().startswith("error:"):
             return _json_error(result.strip()[6:].strip())
         return _json_success(result)
@@ -1449,5 +1489,10 @@ def _configure_mcp_catalog():
 _configure_mcp_catalog()
 
 
-if __name__ == "__main__":
+def main():
+    """Run the stdio MCP server."""
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

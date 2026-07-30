@@ -8,32 +8,55 @@ futures, and equity options. The schema-v3 engine also supports stop,
 stop-limit, trailing-stop, bracket, OCO, OTO, and multi-leg option orders.
 This is a simulation tool and does not place live brokerage orders.
 
-## Setup
+## Scope and safety
+
+TradingCLI is a local paper-trading simulator. It never places live brokerage
+orders, and its Yahoo Finance data is not an exchange-grade feed. Do not use it
+as the sole source for financial decisions or expose its stdio MCP server as an
+unauthenticated network service.
+
+Fetching prices, news, history, and option chains sends held, pending, or
+watchlisted symbols to Yahoo Finance through `yfinance`. See
+[SECURITY.md](SECURITY.md) for the local-data and network privacy model.
+
+## Install
 
 Requires Python 3.10 or newer.
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python3 -m pip install -r requirements.txt
+python3 -m pip install .
+tradingcli --version
 ```
+
+For development:
+
+```bash
+uv sync --locked --extra dev
+uv run python run_tests.py
+```
+
+`uv.lock` pins the complete cross-platform dependency graph. Use the locked
+`uv` workflow for CI and repeatable deployments; the plain `pip` install above
+is the lightweight end-user path.
 
 ## Run
 
 Launch the dashboard and first-run setup wizard:
 
 ```bash
-python3 papertrade.py
+tradingcli
 ```
 
 Examples:
 
 ```bash
-python3 papertrade.py accounts
-python3 papertrade.py buy AAPL 5
-python3 papertrade.py positions
-python3 papertrade.py market
-python3 papertrade.py backtest --lookback-days 3650
+tradingcli accounts
+tradingcli buy AAPL 5
+tradingcli positions
+tradingcli market
+tradingcli backtest --lookback-days 3650
 ```
 
 Press `g` in the dashboard to open **Backtesting & Graphs**. It shows the
@@ -88,6 +111,13 @@ python3 papertrade.py data snapshot AAPL
 python3 papertrade.py data movers
 ```
 
+Portfolio rebalance suggestions are available through the MCP
+`rebalance_suggest` tool. They preserve the account's existing cash allocation,
+optimize only eligible long spot holdings, and explicitly skip shorts, futures,
+and options. When anything is skipped, the response is marked `ok_partial` and
+defines its weight scope explicitly. It is model output—not personalized
+investment advice.
+
 Every command accepts one automation output flag: `--json`, `--csv`, or
 `--quiet`. `--schema` returns the command tree without accessing market data,
 and `doctor` checks database integrity and schema health.
@@ -98,7 +128,7 @@ Start the MCP server over standard input/output:
 python3 mcp_server.py
 ```
 
-The server defaults to a focused 54-tool `core` catalog. It uses canonical
+The server defaults to a focused 55-tool `core` catalog. It uses canonical
 names, includes `portfolio_backtest`, order preview and lifecycle management,
 positions, watchlists, market data, health checks, and backups, and leaves
 destructive account deletion/reset out of the default agent surface. Core
@@ -108,8 +138,8 @@ responses use one compact JSON contract: `{"ok":true,"data":...}` or
 Select a broader catalog before starting the server when an agent needs it:
 
 ```bash
-PAPERTRADE_MCP_PROFILE=advanced python3 mcp_server.py  # 66 canonical tools
-PAPERTRADE_MCP_PROFILE=full python3 mcp_server.py      # all 73, legacy output
+PAPERTRADE_MCP_PROFILE=advanced tradingcli-mcp  # 67 canonical tools
+PAPERTRADE_MCP_PROFILE=full tradingcli-mcp      # all 74, legacy output
 ```
 
 `advanced` adds destructive and specialist option/research/data operations.
@@ -123,8 +153,11 @@ list.
 Mutating tools accept agent attribution and idempotency keys for safe retries
 from multiple independent MCP processes.
 
-Portfolio data defaults to `~/.papertrade.db`. Set `PAPERTRADE_DB` to use a
-different database path.
+Portfolio data defaults to `~/.papertrade.db`. Database files and sidecars are
+forced to owner-only `0600`; the backup directory is `0700` and backups are
+`0600`. Set `PAPERTRADE_DB` to use a different database path. Set
+`PAPERTRADE_MARKET_TIMEOUT` to change the default 15-second timeout used by
+historical-data requests.
 
 Yahoo Finance supplies the market data. Its historical quote/trade series and
 crypto top-of-book output are explicitly marked aggregated or indicative;
@@ -132,20 +165,14 @@ Yahoo does not expose exchange tick tapes or full order-book depth.
 
 ## Verify
 
-The tests are standalone scripts:
+Run the isolated contract suite:
 
 ```bash
-python3 test_papertrade.py
-python3 test_backtesting.py
-python3 test_performance.py
-python3 test_concurrency.py
-python3 test_mcp_server.py
-python3 test_mcp_profiles.py
-python3 test_dashboard.py
-python3 test_alpaca_parity.py
-python3 test_cli.py
-python3 test_edge_cases.py
-python3 test_market_data.py
-python3 test_mcp_features.py
-python3 test_invariants.py
+python3 run_tests.py
+ruff check .
+python3 -m build
 ```
+
+The runner discovers every `test_*.py` contract and executes each one in an
+isolated subprocess and temporary database. GitHub Actions runs the same checks
+on Python 3.10 and 3.13.

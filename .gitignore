@@ -1,4 +1,26 @@
 __pycache__/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
 *.pyc
 .DS_Store
+
+# Virtual environments and local configuration
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Local portfolio state and SQLite sidecars
+.papertrade.db*
+*.db
+*.db-shm
+*.db-wal
+
+# Build and coverage artifacts
+build/
+dist/
+*.egg-info/
+.coverage*
+htmlcov/

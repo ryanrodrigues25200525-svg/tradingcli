@@ -1075,20 +1075,15 @@ def run_dashboard(console, args):
                 # language, so this is fixed here rather than by a rewrite.
                 key = read_key(0.15)
 
-                # yfinance/requests sets no default socket timeout, so a
-                # genuinely stalled connection (not a clean error -- those
-                # are already caught inside fetch_quotes) could otherwise
-                # leave `pending` stuck forever: never done, so neither the
-                # auto-refresh check nor a manual t/r press could ever fire
-                # again for the rest of the session. Treat a fetch that's
-                # been running unreasonably long (real ones take 1-5s) as
-                # abandoned instead. The thread itself is daemon and keeps
-                # running in the background until/if it ever finishes, but
-                # its result is just discarded -- the UI recovers either way.
+                # Keep one in-flight generation at a time. Older versions
+                # discarded the holder after 45 seconds while its daemon
+                # thread and pool jobs kept running, allowing repeated stalls
+                # to accumulate workers. The UI remains responsive while this
+                # holder is pending, and a late result is accepted instead of
+                # creating an unbounded sequence of abandoned refreshes.
                 if pending is not None and not pending["done"]:
                     if time.monotonic() - pending["started_at"] > 45.0:
-                        pending = None
-                        next_refresh_at = time.monotonic()
+                        pending["timed_out"] = True
 
                 if pending is not None and pending["done"]:
                     quotes = pending["quotes"]
