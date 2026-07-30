@@ -114,7 +114,7 @@ with tempfile.TemporaryDirectory() as tmp:
         == 2
     )
 
-    # Schema-v4 mutations remain exactly-once across independent MCP processes.
+    # Schema-v5 mutations remain exactly-once across independent MCP processes.
     pt.create_account(conn, "advanced", 100_000, make_default=False)
     conn.close()
     run_many("advanced_idem", 30, env)

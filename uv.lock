@@ -2684,6 +2684,7 @@ name = "tradingcli"
 source = { editable = "." }
 dependencies = [
     { name = "backtesting" },
+    { name = "cryptography" },
     { name = "exchange-calendars" },
     { name = "mcp" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -2706,6 +2707,7 @@ dev = [
 requires-dist = [
     { name = "backtesting", specifier = ">=0.6.5,<1" },
     { name = "build", marker = "extra == 'dev'", specifier = ">=1.2,<2" },
+    { name = "cryptography", specifier = ">=44,<50" },
     { name = "exchange-calendars", specifier = ">=4.13,<5" },
     { name = "mcp", specifier = ">=1.27,<2" },
     { name = "numpy", specifier = ">=2,<3" },

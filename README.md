@@ -4,7 +4,7 @@ A local, multi-account paper-trading CLI, live terminal dashboard, and MCP
 server. It stores portfolio state in SQLite and uses Yahoo Finance market data.
 
 Supported instruments include equities, ETFs, crypto, foreign exchange,
-futures, and equity options. The schema-v4 engine also supports stop,
+futures, and equity options. The schema-v5 engine also supports stop,
 stop-limit, trailing-stop, bracket, OCO, OTO, and multi-leg option orders.
 This is a simulation tool and does not place live brokerage orders.
 
@@ -118,6 +118,83 @@ and options. When anything is skipped, the response is marked `ok_partial` and
 defines its weight scope explicitly. It is model output—not personalized
 investment advice.
 
+## Operational platform
+
+Version 0.4 adds an append-only double-entry ledger alongside the portfolio
+projection. Funding, fills, commissions, and schema-v5 opening balances are
+balanced transactions; reconciliation can report or repair drift:
+
+```bash
+tradingcli ledger balances
+tradingcli ledger reconcile
+tradingcli ledger reconcile --repair
+```
+
+Execution simulation defaults to the legacy zero-cost/full-fill behavior.
+Configure commissions, adverse slippage, liquidity participation, and a
+maximum fill size per account:
+
+```bash
+tradingcli execution set --commission-bps 5 --slippage-bps 10 \
+  --liquidity-fraction 0.5 --max-fill-quantity 100
+tradingcli execution preview buy 250 185
+```
+
+Risk limits now include daily realized loss, peak-equity drawdown, per-symbol
+exposure, and concentration:
+
+```bash
+tradingcli risk --max-daily-loss 1000 --max-drawdown 0.10 \
+  --max-symbol-exposure 25000 --max-concentration 0.30
+```
+
+Research, journal, automation, and interchange commands:
+
+```bash
+tradingcli strategy walk-forward AAPL
+tradingcli journal add "Earnings breakout" --tags setup,earnings --symbol AAPL
+tradingcli journal attribution
+tradingcli automation add nightly-backup backup --interval-seconds 86400
+tradingcli automation run-due
+tradingcli broker export alpaca
+tradingcli broker import ibkr trades.csv
+```
+
+Automations are persisted and keep run history, but TradingCLI does not install
+an operating-system daemon. Invoke `automation run-due` from cron, launchd, or
+another trusted scheduler.
+
+Backups can be inventoried, retained, and restored. Restore requires `--yes`
+and first creates another consistent safety backup:
+
+```bash
+tradingcli backup list
+tradingcli backup prune --keep 10
+tradingcli backup restore /path/to/backup.db --yes
+```
+
+Authenticated encrypted snapshots protect portable database copies while the
+live SQLite file retains owner-only permissions:
+
+```bash
+PAPERTRADE_ENCRYPTION_PASSWORD='...' \
+  tradingcli security encrypt-copy portfolio.db.enc
+PAPERTRADE_ENCRYPTION_PASSWORD='...' \
+  tradingcli security decrypt-copy portfolio.db.enc restored.db
+```
+
+An authenticated, loopback-only HTTP API exposes health, accounts, positions,
+journal entries, and order previews. Tokens must be at least 24 characters:
+
+```bash
+PAPERTRADE_API_TOKEN='replace-with-a-long-random-token' tradingcli serve
+```
+
+Static prices can precede Yahoo in the provider chain for deterministic tests
+or failover. Configure `PAPERTRADE_PRICE_PROVIDERS=static,yahoo`,
+`PAPERTRADE_STATIC_PRICES='{"AAPL":185.25}'`, and optionally
+`PAPERTRADE_PRICE_CACHE_TTL`.
+
 Every command accepts one automation output flag: `--json`, `--csv`, or
 `--quiet`. `--schema` returns the command tree without accessing market data,
 and `doctor` checks physical integrity, logical relationships, fixed-precision
@@ -129,7 +206,7 @@ Start the MCP server over standard input/output:
 python3 mcp_server.py
 ```
 
-The server defaults to a focused 55-tool `core` catalog. It uses canonical
+The server defaults to a focused 63-tool `core` catalog. It uses canonical
 names, includes `portfolio_backtest`, order preview and lifecycle management,
 positions, watchlists, market data, health checks, and backups, and leaves
 destructive account deletion/reset out of the default agent surface. Core
@@ -139,8 +216,8 @@ responses use one compact JSON contract: `{"ok":true,"data":...}` or
 Select a broader catalog before starting the server when an agent needs it:
 
 ```bash
-PAPERTRADE_MCP_PROFILE=advanced tradingcli-mcp  # 67 canonical tools
-PAPERTRADE_MCP_PROFILE=full tradingcli-mcp      # all 74, legacy output
+PAPERTRADE_MCP_PROFILE=advanced tradingcli-mcp  # 79 canonical tools
+PAPERTRADE_MCP_PROFILE=full tradingcli-mcp      # all 86, legacy output
 ```
 
 `advanced` adds destructive and specialist option/research/data operations.
@@ -160,7 +237,7 @@ forced to owner-only `0600`; the backup directory is `0700` and backups are
 `PAPERTRADE_MARKET_TIMEOUT` to change the default 15-second timeout used by
 historical-data requests.
 
-Schema v4 normalizes money to 2 decimal places, prices to 6, and quantities to
+Schema v5 normalizes money to 2 decimal places, prices to 6, and quantities to
 8 using decimal half-even rounding. SQLite guards reject invalid domains,
 orphaned account/watchlist records, and values outside those precision
 contracts—even when a caller bypasses the CLI.

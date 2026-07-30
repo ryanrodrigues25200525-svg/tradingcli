@@ -644,6 +644,14 @@ def risk_set(
     allow_naked_options: bool | None = None,
     max_gross_leverage: float | None = None,
     max_order_notional: float | None = None,
+    max_daily_loss: float | None = None,
+    max_drawdown: float | None = None,
+    max_symbol_exposure: float | None = None,
+    max_concentration: float | None = None,
+    clear_daily_loss: bool = False,
+    clear_drawdown: bool = False,
+    clear_symbol_exposure: bool = False,
+    clear_concentration: bool = False,
     clear_max_order: bool = False,
     idempotency_key: str | None = None,
     agent: str = "mcp",
@@ -656,7 +664,15 @@ def risk_set(
         allow_naked_options,
         max_gross_leverage,
         max_order_notional,
-        clear_max_order,
+        clear_max_order=clear_max_order,
+        max_daily_loss=max_daily_loss,
+        max_drawdown=max_drawdown,
+        max_symbol_exposure=max_symbol_exposure,
+        max_concentration=max_concentration,
+        clear_daily_loss=clear_daily_loss,
+        clear_drawdown=clear_drawdown,
+        clear_symbol_exposure=clear_symbol_exposure,
+        clear_concentration=clear_concentration,
         source=agent,
         request_id=idempotency_key,
     )
@@ -724,6 +740,146 @@ def database_backup() -> str:
         return f"error: backup failed: {exc}"
     finally:
         conn.close()
+
+
+@mcp.tool()
+def database_backups() -> str:
+    """List validated manual and pre-migration backups."""
+    return json.dumps(pt.features.backup_inventory(pt.DB), indent=2)
+
+
+@mcp.tool()
+def ledger_balances(account: str) -> str:
+    """Return double-entry ledger balances for an account."""
+    with pt.connection() as conn:
+        return json.dumps(pt.features.ledger_balance(conn, account), indent=2)
+
+
+@mcp.tool()
+def ledger_reconcile(account: str, repair: bool = False) -> str:
+    """Compare ledger assets with portfolio state; optionally post a repair transaction."""
+    with pt.connection() as conn:
+        with pt.writing(conn):
+            return json.dumps(pt.features.reconcile(conn, account, repair), indent=2)
+
+
+@mcp.tool()
+def execution_get(account: str) -> str:
+    """Return commission, slippage, liquidity, and partial-fill settings."""
+    with pt.connection() as conn:
+        return json.dumps(pt.features.execution_settings(conn, account), indent=2)
+
+
+@mcp.tool()
+def execution_set(
+    account: str,
+    commission_bps: float | None = None,
+    slippage_bps: float | None = None,
+    max_fill_quantity: float | None = None,
+    liquidity_fraction: float | None = None,
+    clear_max_fill: bool = False,
+) -> str:
+    """Update realistic execution settings for one account."""
+    with pt.connection() as conn:
+        with pt.writing(conn):
+            result = pt.features.set_execution_settings(
+                conn,
+                account,
+                commission_bps,
+                slippage_bps,
+                max_fill_quantity,
+                liquidity_fraction,
+                clear_max_fill,
+            )
+        return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def journal_list(
+    account: str,
+    limit: int = 100,
+    tag: str | None = None,
+    symbol: str | None = None,
+) -> str:
+    """List trade-journal entries, optionally filtered by tag or symbol."""
+    with pt.connection() as conn:
+        return json.dumps(
+            pt.features.journal_list(conn, account, limit, tag, symbol), indent=2
+        )
+
+
+@mcp.tool()
+def journal_add(
+    account: str,
+    title: str,
+    body: str = "",
+    tags: str = "",
+    symbol: str | None = None,
+    order_id: int | None = None,
+) -> str:
+    """Add a trade-journal entry; tags are comma-separated."""
+    with pt.connection() as conn:
+        with pt.writing(conn):
+            entry_id = pt.features.journal_add(
+                conn,
+                account,
+                title,
+                body,
+                tags.split(","),
+                symbol,
+                order_id,
+            )
+        return json.dumps({"id": entry_id})
+
+
+@mcp.tool()
+def journal_attribution(account: str) -> str:
+    """Attribute net realized results and commissions by symbol."""
+    with pt.connection() as conn:
+        return json.dumps(pt.features.performance_attribution(conn, account), indent=2)
+
+
+@mcp.tool()
+def strategy_walk_forward(symbol: str) -> str:
+    """Select SMA parameters on training history and report out-of-sample results."""
+    try:
+        return json.dumps(pt.features.walk_forward_sma(symbol), indent=2)
+    except SystemExit as exc:
+        return f"error: {exc}"
+
+
+@mcp.tool()
+def automation_list() -> str:
+    """List persisted local automation schedules."""
+    with pt.connection() as conn:
+        return json.dumps(pt.features.schedule_list(conn), indent=2)
+
+
+@mcp.tool()
+def automation_run_due() -> str:
+    """Run due tick, backup, and reconciliation jobs."""
+    with pt.connection() as conn:
+        def execute(action, payload):
+            if action == "tick":
+                pt.tick(conn)
+                return {"ticked": True}
+            if action == "backup":
+                return {"backup": os.path.basename(pt.backup_database(conn))}
+            account = pt.resolve_account(conn, payload.get("account"))
+            with pt.writing(conn):
+                return pt.features.reconcile(conn, account, repair=True)
+
+        return json.dumps(pt.features.run_due(conn, execute), indent=2)
+
+
+@mcp.tool()
+def broker_export(account: str, broker: str = "generic") -> str:
+    """Export filled orders using generic, Alpaca, or IBKR CSV headers."""
+    with pt.connection() as conn:
+        try:
+            return pt.features.broker_export(conn, account, broker)
+        except SystemExit as exc:
+            return f"error: {exc}"
 
 
 @mcp.tool()
@@ -1343,6 +1499,14 @@ CORE_MCP_TOOLS = frozenset(
         "audit_log",
         "healthcheck",
         "database_backup",
+        "database_backups",
+        "ledger_balances",
+        "execution_get",
+        "journal_list",
+        "journal_attribution",
+        "strategy_walk_forward",
+        "automation_list",
+        "broker_export",
     }
 )
 

@@ -27,8 +27,10 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from functools import lru_cache
 
+import tradingcli_features as features
+
 DB = os.environ.get("PAPERTRADE_DB", os.path.expanduser("~/.papertrade.db"))
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 MARKET_DATA_TIMEOUT = max(
     1.0, float(os.environ.get("PAPERTRADE_MARKET_TIMEOUT", "15"))
 )
@@ -60,7 +62,7 @@ FUTURES = {
 }
 
 OCC_RE = re.compile(r"^([A-Z]{1,6})(\d{2})(\d{2})(\d{2})([CP])(\d{8})$")
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 MONEY_QUANTUM = Decimal("0.01")
 PRICE_QUANTUM = Decimal("0.000001")
 QUANTITY_QUANTUM = Decimal("0.00000001")
@@ -69,6 +71,10 @@ DEFAULT_RISK = {
     "allow_naked_options": False,
     "max_gross_leverage": 2.0,
     "max_order_notional": None,
+    "max_daily_loss": None,
+    "max_drawdown": None,
+    "max_symbol_exposure": None,
+    "max_concentration": None,
 }
 ORDER_TYPES = {"market", "limit", "stop", "stop_limit", "trailing_stop"}
 TIME_IN_FORCE = {"gtc", "day", "ioc", "fok", "opg", "cls"}
@@ -115,6 +121,7 @@ CREATE TABLE IF NOT EXISTS option_instructions(account TEXT NOT NULL,
   source TEXT NOT NULL DEFAULT 'unknown', request_id TEXT,
   PRIMARY KEY(account, symbol));
 """
+SCHEMA += features.FEATURE_SCHEMA
 
 
 def _fixed(value, quantum, label):
@@ -167,6 +174,9 @@ def _install_data_guards(conn):
         "corporate_sync",
         "watchlists",
         "option_instructions",
+        "execution_settings",
+        "journal_entries",
+        "equity_peaks",
     )
     for table in account_children:
         _install_guard(
@@ -250,7 +260,7 @@ def _install_data_guards(conn):
         " OR NEW.qty IS NULL OR NEW.qty<=0 OR abs(NEW.qty)>1e12"
         " OR NEW.status NOT IN"
         " ('pending','held','filled','canceled','rejected','replaced','expired',"
-        "  'settled','exercised')"
+        "  'settled','exercised','partially_filled')"
         " OR NEW.order_type NOT IN"
         " ('market','limit','stop','stop_limit','trailing_stop')"
         " OR NEW.time_in_force NOT IN ('gtc','day','ioc','fok','opg','cls')"
@@ -262,6 +272,8 @@ def _install_data_guards(conn):
         " OR (NEW.trail_price IS NOT NULL AND NEW.trail_price<=0)"
         " OR (NEW.trail_percent IS NOT NULL AND NEW.trail_percent<=0)"
         " OR (NEW.notional IS NOT NULL AND NEW.notional<=0)"
+        " OR NEW.commission<0 OR NEW.slippage<0"
+        " OR (NEW.filled_qty IS NOT NULL AND NEW.filled_qty<=0)"
         " OR abs(NEW.qty*1e8-round(NEW.qty*1e8))>0.000001"
         " OR (NEW.limit_price IS NOT NULL"
         " AND abs(NEW.limit_price*1e6-round(NEW.limit_price*1e6))>0.000001)"
@@ -274,7 +286,11 @@ def _install_data_guards(conn):
         " OR (NEW.trail_percent IS NOT NULL"
         " AND abs(NEW.trail_percent*1e8-round(NEW.trail_percent*1e8))>0.000001)"
         " OR (NEW.notional IS NOT NULL"
-        " AND abs(NEW.notional*100-round(NEW.notional*100))>0.000001)",
+        " AND abs(NEW.notional*100-round(NEW.notional*100))>0.000001)"
+        " OR abs(NEW.commission*100-round(NEW.commission*100))>0.000001"
+        " OR abs(NEW.slippage*100-round(NEW.slippage*100))>0.000001"
+        " OR (NEW.filled_qty IS NOT NULL"
+        " AND abs(NEW.filled_qty*1e8-round(NEW.filled_qty*1e8))>0.000001)",
         "invalid order values",
     )
     _install_guard(
@@ -292,6 +308,12 @@ def _install_data_guards(conn):
         " OR abs(NEW.max_gross_leverage*1e8"
         " -round(NEW.max_gross_leverage*1e8))>0.000001"
         " OR (NEW.max_order_notional IS NOT NULL AND NEW.max_order_notional<=0)"
+        " OR (NEW.max_daily_loss IS NOT NULL AND NEW.max_daily_loss<=0)"
+        " OR (NEW.max_symbol_exposure IS NOT NULL AND NEW.max_symbol_exposure<=0)"
+        " OR (NEW.max_drawdown IS NOT NULL"
+        " AND (NEW.max_drawdown<=0 OR NEW.max_drawdown>1))"
+        " OR (NEW.max_concentration IS NOT NULL"
+        " AND (NEW.max_concentration<=0 OR NEW.max_concentration>1))"
         " OR (NEW.max_order_notional IS NOT NULL"
         " AND abs(NEW.max_order_notional*100"
         " -round(NEW.max_order_notional*100))>0.000001)",
@@ -355,6 +377,9 @@ def _database_invariants(conn):
             "corporate_sync",
             "watchlists",
             "option_instructions",
+            "execution_settings",
+            "journal_entries",
+            "equity_peaks",
         )
     }
     orphan_checks["watchlist_symbols"] = conn.execute(
@@ -381,7 +406,7 @@ def _database_invariants(conn):
             " OR side NOT IN ('buy','sell') OR qty IS NULL OR qty<=0"
             " OR status NOT IN"
             " ('pending','held','filled','canceled','rejected','replaced','expired',"
-            "  'settled','exercised')"
+            "  'settled','exercised','partially_filled')"
             " OR order_type NOT IN ('market','limit','stop','stop_limit','trailing_stop')"
             " OR time_in_force NOT IN ('gtc','day','ioc','fok','opg','cls')"
             " OR order_class NOT IN ('simple','bracket','oco','oto','mleg')"
@@ -392,6 +417,8 @@ def _database_invariants(conn):
             " OR (trail_price IS NOT NULL AND trail_price<=0)"
             " OR (trail_percent IS NOT NULL AND trail_percent<=0)"
             " OR (notional IS NOT NULL AND notional<=0)"
+            " OR commission<0 OR slippage<0"
+            " OR (filled_qty IS NOT NULL AND filled_qty<=0)"
         ).fetchone()[0],
         "cashflow": conn.execute(
             "SELECT COUNT(*) FROM cashflow"
@@ -402,6 +429,12 @@ def _database_invariants(conn):
             " WHERE allow_short NOT IN (0,1) OR allow_naked_options NOT IN (0,1)"
             " OR max_gross_leverage IS NULL OR max_gross_leverage<=0"
             " OR (max_order_notional IS NOT NULL AND max_order_notional<=0)"
+            " OR (max_daily_loss IS NOT NULL AND max_daily_loss<=0)"
+            " OR (max_symbol_exposure IS NOT NULL AND max_symbol_exposure<=0)"
+            " OR (max_drawdown IS NOT NULL"
+            " AND (max_drawdown<=0 OR max_drawdown>1))"
+            " OR (max_concentration IS NOT NULL"
+            " AND (max_concentration<=0 OR max_concentration>1))"
         ).fetchone()[0],
         "corporate_actions": conn.execute(
             "SELECT COUNT(*) FROM corporate_actions"
@@ -463,6 +496,10 @@ def _database_invariants(conn):
             " AND abs(trail_percent*1e8-round(trail_percent*1e8))>0.000001)"
             " OR (notional IS NOT NULL"
             " AND abs(notional*100-round(notional*100))>0.000001)"
+            " OR abs(commission*100-round(commission*100))>0.000001"
+            " OR abs(slippage*100-round(slippage*100))>0.000001"
+            " OR (filled_qty IS NOT NULL"
+            " AND abs(filled_qty*1e8-round(filled_qty*1e8))>0.000001)"
         ).fetchone()[0],
         "risk_settings": conn.execute(
             "SELECT COUNT(*) FROM risk_settings"
@@ -470,6 +507,15 @@ def _database_invariants(conn):
             " -round(max_gross_leverage*1e8))>0.000001"
             " OR (max_order_notional IS NOT NULL"
             " AND abs(max_order_notional*100-round(max_order_notional*100))>0.000001)"
+            " OR (max_daily_loss IS NOT NULL"
+            " AND abs(max_daily_loss*100-round(max_daily_loss*100))>0.000001)"
+            " OR (max_symbol_exposure IS NOT NULL"
+            " AND abs(max_symbol_exposure*100"
+            " -round(max_symbol_exposure*100))>0.000001)"
+            " OR (max_drawdown IS NOT NULL"
+            " AND abs(max_drawdown*1e8-round(max_drawdown*1e8))>0.000001)"
+            " OR (max_concentration IS NOT NULL"
+            " AND abs(max_concentration*1e8-round(max_concentration*1e8))>0.000001)"
         ).fetchone()[0],
         "corporate_actions": conn.execute(
             "SELECT COUNT(*) FROM corporate_actions"
@@ -581,13 +627,16 @@ def migrate(conn):
     conn.execute(
         "INSERT OR IGNORE INTO risk_settings(account) SELECT name FROM accounts"
     )
+    features.prepare_migration(conn)
     _normalize_storage(conn)
+    features.finalize_migration(conn)
     invariants = _database_invariants(conn)
     if invariants["total"]:
         raise RuntimeError(
             f"database migration blocked by {invariants['total']} logical violation(s)"
         )
     _install_data_guards(conn)
+    features.install_guards(conn)
 
 
 def _normalize_storage(conn):
@@ -629,6 +678,10 @@ def _normalize_storage(conn):
             (
                 ("max_gross_leverage", _quantity),
                 ("max_order_notional", _money),
+                ("max_daily_loss", _money),
+                ("max_drawdown", _quantity),
+                ("max_symbol_exposure", _money),
+                ("max_concentration", _quantity),
             ),
         ),
         (
@@ -748,6 +801,7 @@ def db():
                         )
                     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         _install_data_guards(conn)
+        features.install_guards(conn)
         return conn
     except BaseException:
         conn.close()
@@ -835,7 +889,8 @@ def risk_limits(conn, account):
     if not conn.execute("SELECT 1 FROM accounts WHERE name=?", (account,)).fetchone():
         raise SystemExit(f"no account '{account}'")
     row = conn.execute(
-        "SELECT allow_short,allow_naked_options,max_gross_leverage,max_order_notional"
+        "SELECT allow_short,allow_naked_options,max_gross_leverage,max_order_notional,"
+        "max_daily_loss,max_drawdown,max_symbol_exposure,max_concentration"
         " FROM risk_settings WHERE account=?",
         (account,),
     ).fetchone()
@@ -846,6 +901,10 @@ def risk_limits(conn, account):
         "allow_naked_options": bool(row[1]),
         "max_gross_leverage": float(row[2]),
         "max_order_notional": float(row[3]) if row[3] is not None else None,
+        "max_daily_loss": float(row[4]) if row[4] is not None else None,
+        "max_drawdown": float(row[5]) if row[5] is not None else None,
+        "max_symbol_exposure": float(row[6]) if row[6] is not None else None,
+        "max_concentration": float(row[7]) if row[7] is not None else None,
     }
 
 
@@ -857,6 +916,14 @@ def set_risk_limits(
     max_gross_leverage=None,
     max_order_notional=None,
     clear_max_order=False,
+    max_daily_loss=None,
+    max_drawdown=None,
+    max_symbol_exposure=None,
+    max_concentration=None,
+    clear_daily_loss=False,
+    clear_drawdown=False,
+    clear_symbol_exposure=False,
+    clear_concentration=False,
     source="cli",
     request_id=None,
 ):
@@ -866,6 +933,14 @@ def set_risk_limits(
         "allow_naked_options": allow_naked_options,
         "max_gross_leverage": max_gross_leverage,
         "max_order_notional": max_order_notional,
+        "max_daily_loss": max_daily_loss,
+        "max_drawdown": max_drawdown,
+        "max_symbol_exposure": max_symbol_exposure,
+        "max_concentration": max_concentration,
+        "clear_daily_loss": bool(clear_daily_loss),
+        "clear_drawdown": bool(clear_drawdown),
+        "clear_symbol_exposure": bool(clear_symbol_exposure),
+        "clear_concentration": bool(clear_concentration),
         "clear_max_order": bool(clear_max_order),
     }
     if max_gross_leverage is not None and (
@@ -878,6 +953,26 @@ def set_risk_limits(
         raise SystemExit("max order notional must be a positive finite number")
     if max_order_notional is not None:
         max_order_notional = _money(max_order_notional)
+    for value, label in (
+        (max_daily_loss, "max daily loss"),
+        (max_symbol_exposure, "max symbol exposure"),
+    ):
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            raise SystemExit(f"{label} must be a positive finite number")
+    for value, label in (
+        (max_drawdown, "max drawdown"),
+        (max_concentration, "max concentration"),
+    ):
+        if value is not None and (not math.isfinite(value) or not 0 < value <= 1):
+            raise SystemExit(f"{label} must be between 0 and 1")
+    max_daily_loss = _money(max_daily_loss) if max_daily_loss is not None else None
+    max_symbol_exposure = (
+        _money(max_symbol_exposure) if max_symbol_exposure is not None else None
+    )
+    max_drawdown = _quantity(max_drawdown) if max_drawdown is not None else None
+    max_concentration = (
+        _quantity(max_concentration) if max_concentration is not None else None
+    )
     if max_gross_leverage is not None:
         max_gross_leverage = _quantity(max_gross_leverage)
     with writing(conn):
@@ -902,17 +997,42 @@ def set_risk_limits(
                 if max_order_notional is None
                 else float(max_order_notional)
             ),
+            "max_daily_loss": None
+            if clear_daily_loss
+            else current["max_daily_loss"]
+            if max_daily_loss is None
+            else max_daily_loss,
+            "max_drawdown": None
+            if clear_drawdown
+            else current["max_drawdown"]
+            if max_drawdown is None
+            else max_drawdown,
+            "max_symbol_exposure": None
+            if clear_symbol_exposure
+            else current["max_symbol_exposure"]
+            if max_symbol_exposure is None
+            else max_symbol_exposure,
+            "max_concentration": None
+            if clear_concentration
+            else current["max_concentration"]
+            if max_concentration is None
+            else max_concentration,
         }
         conn.execute(
             "INSERT OR REPLACE INTO risk_settings"
-            "(account,allow_short,allow_naked_options,max_gross_leverage,max_order_notional)"
-            " VALUES(?,?,?,?,?)",
+            "(account,allow_short,allow_naked_options,max_gross_leverage,max_order_notional,"
+            "max_daily_loss,max_drawdown,max_symbol_exposure,max_concentration)"
+            " VALUES(?,?,?,?,?,?,?,?,?)",
             (
                 account,
                 int(updated["allow_short"]),
                 int(updated["allow_naked_options"]),
                 updated["max_gross_leverage"],
                 updated["max_order_notional"],
+                updated["max_daily_loss"],
+                updated["max_drawdown"],
+                updated["max_symbol_exposure"],
+                updated["max_concentration"],
             ),
         )
         _audit_locked(conn, "risk.set", account, source, request_id, details)
@@ -1027,8 +1147,7 @@ def _quiet_yf():
         logging.getLogger(name).setLevel(logging.CRITICAL)
 
 
-def live_price(symbol):
-    symbol = symbol.upper()
+def _yahoo_live_price(symbol):
     _quiet_yf()
     if OCC_RE.match(symbol):
         return option_price(symbol)
@@ -1046,6 +1165,14 @@ def live_price(symbol):
     if not p or p <= 0:
         raise SystemExit(f"no price for {symbol} (unknown or delisted symbol?)")
     return float(p)
+
+
+def live_price(symbol):
+    symbol = symbol.upper()
+    ttl = max(0.0, float(os.environ.get("PAPERTRADE_PRICE_CACHE_TTL", "5")))
+    return features.provider_price(
+        symbol, lambda: _yahoo_live_price(symbol), ttl=ttl
+    )
 
 
 def _apply(state, symbol, side, qty, price):
@@ -1229,6 +1356,74 @@ def _risk_report_locked(conn, account, symbol, side, qty, price, before, after):
             f"gross leverage {leverage:.2f}x exceeds limit "
             f"{limits['max_gross_leverage']:.2f}x"
         )
+    position = after["pos"].get(symbol)
+    symbol_exposure = 0.0
+    if position:
+        symbol_exposure = (
+            abs(position["margin"])
+            if position["ac"] == "future"
+            else abs(position["qty"] * position["mult"] * price)
+        )
+    concentration = symbol_exposure / gross_after if gross_after > 0 else 0.0
+    if (
+        not reason
+        and increasing
+        and limits["max_symbol_exposure"] is not None
+        and symbol_exposure > limits["max_symbol_exposure"] + 1e-9
+    ):
+        reason = (
+            f"symbol exposure {symbol_exposure:,.2f} exceeds limit "
+            f"{limits['max_symbol_exposure']:,.2f}"
+        )
+    if (
+        not reason
+        and increasing
+        and limits["max_concentration"] is not None
+        and concentration > limits["max_concentration"] + 1e-9
+    ):
+        reason = (
+            f"symbol concentration {concentration:.1%} exceeds limit "
+            f"{limits['max_concentration']:.1%}"
+        )
+    today = datetime.now(timezone.utc).date().isoformat()
+    income = conn.execute(
+        "SELECT COALESCE(SUM(e.amount),0) FROM ledger_entries e"
+        " JOIN ledger_transactions t ON t.id=e.transaction_id"
+        " WHERE t.account=? AND substr(t.ts,1,10)=?"
+        " AND e.book IN ('income:realized','expense:commission')",
+        (account, today),
+    ).fetchone()[0]
+    daily_pnl_after = _money(-income + after.get("realized", 0))
+    daily_loss_after = max(0.0, -daily_pnl_after)
+    if (
+        not reason
+        and increasing
+        and limits["max_daily_loss"] is not None
+        and daily_loss_after > limits["max_daily_loss"] + 1e-9
+    ):
+        reason = (
+            f"daily loss {daily_loss_after:,.2f} exceeds limit "
+            f"{limits['max_daily_loss']:,.2f}"
+        )
+    peak_row = conn.execute(
+        "SELECT peak FROM equity_peaks WHERE account=?", (account,)
+    ).fetchone()
+    peak_equity = max(equity_before, peak_row[0] if peak_row else equity_before)
+    drawdown = (
+        max(0.0, (peak_equity - equity_after) / peak_equity)
+        if peak_equity > 0
+        else 0.0
+    )
+    if (
+        not reason
+        and increasing
+        and limits["max_drawdown"] is not None
+        and drawdown > limits["max_drawdown"] + 1e-9
+    ):
+        reason = (
+            f"drawdown {drawdown:.1%} exceeds limit "
+            f"{limits['max_drawdown']:.1%}"
+        )
     return {
         "allowed": reason is None,
         "reason": reason,
@@ -1247,6 +1442,11 @@ def _risk_report_locked(conn, account, symbol, side, qty, price, before, after):
         "gross_before": gross_before,
         "gross_after": gross_after,
         "gross_leverage_after": leverage,
+        "symbol_exposure_after": symbol_exposure,
+        "symbol_concentration_after": concentration,
+        "daily_loss_after": daily_loss_after,
+        "drawdown_after": drawdown,
+        "peak_equity": peak_equity,
         "limits": limits,
     }
 
@@ -1289,12 +1489,47 @@ def preview_order(conn, account, symbol, side, qty, price=None, price_fn=live_pr
         return _preview_locked(conn, account, symbol, side, qty, price)
 
 
-def _fill_locked(conn, account, symbol, side, qty, price, enforce_risk=True):
+def _fill_locked(
+    conn,
+    account,
+    symbol,
+    side,
+    qty,
+    price,
+    enforce_risk=True,
+    simulate_execution=None,
+):
     """Apply a fill while the caller owns a writing() transaction."""
     before = _portfolio_state_locked(conn, account)
+    if simulate_execution is None:
+        simulate_execution = enforce_risk
+    execution = (
+        features.realistic_fill(conn, account, side, qty, price)
+        if simulate_execution
+        else {
+            "requested_quantity": qty,
+            "filled_quantity": qty,
+            "remaining_quantity": 0.0,
+            "fill_price": _price(price),
+            "slippage": 0.0,
+            "commission": 0.0,
+            "partial": False,
+        }
+    )
+    qty = execution["filled_quantity"]
+    price = execution["fill_price"]
+    if qty <= 0:
+        raise SystemExit("execution settings produced a zero fill")
     state = _clone_state(before)
     _apply(state, symbol, side, qty, price)
+    commission = execution["commission"]
+    if commission:
+        state["cash"] = _money(state["cash"] - commission)
+        state["realized"] = _money(state["realized"] - commission)
+        if state["cash"] < 0:
+            raise SystemExit("insufficient cash for execution commission")
     report = _risk_report_locked(conn, account, symbol, side, qty, price, before, state)
+    report["execution"] = execution
     if enforce_risk and not report["allowed"]:
         raise SystemExit(f"risk rejected: {report['reason']}")
     if symbol in state["pos"]:
@@ -1314,6 +1549,19 @@ def _fill_locked(conn, account, symbol, side, qty, price, enforce_risk=True):
     conn.execute(
         "UPDATE accounts SET cash=?, realized=? WHERE name=?",
         (state["cash"], _money(current_realized + state["realized"]), account),
+    )
+    features.record_fill(
+        conn, account, symbol, side, qty, price, before, state, commission
+    )
+    conn.execute(
+        "INSERT INTO equity_peaks(account,peak,updated) VALUES(?,?,?)"
+        " ON CONFLICT(account) DO UPDATE SET peak=max(peak,excluded.peak),"
+        " updated=excluded.updated",
+        (
+            account,
+            max(report["equity_before"], report["equity_after"]),
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        ),
     )
     return report
 
@@ -1526,7 +1774,9 @@ def place(
             if existing:
                 _print_replayed_order(existing)
                 return existing["id"]
-            _fill_locked(conn, account, symbol, side, qty, price)
+            report = _fill_locked(conn, account, symbol, side, qty, price)
+            execution = report["execution"]
+            status = "partially_filled" if execution["partial"] else "filled"
             oid = _insert_order_locked(
                 conn,
                 account,
@@ -1534,11 +1784,20 @@ def place(
                 side,
                 qty,
                 None,
-                "filled",
-                price,
+                status,
+                execution["fill_price"],
                 ts,
                 source,
                 request_id,
+            )
+            conn.execute(
+                "UPDATE orders SET filled_qty=?,commission=?,slippage=? WHERE id=?",
+                (
+                    execution["filled_quantity"],
+                    execution["commission"],
+                    execution["slippage"],
+                    oid,
+                ),
             )
             _audit_locked(
                 conn,
@@ -1546,9 +1805,17 @@ def place(
                 account,
                 source,
                 request_id,
-                {**intent, "order_id": oid, "filled_price": price},
+                {
+                    **intent,
+                    "order_id": oid,
+                    "filled_price": execution["fill_price"],
+                    "filled_quantity": execution["filled_quantity"],
+                },
             )
-        print(f"filled #{oid} {side} {qty:g} {symbol} @ {price:.2f}")
+        print(
+            f"{status} #{oid} {side} {execution['filled_quantity']:g} "
+            f"{symbol} @ {execution['fill_price']:.2f}"
+        )
     else:
         with writing(conn):
             existing = _existing_order(conn, source, request_id, intent)
@@ -2009,8 +2276,11 @@ def submit_order(
         preview = _preview_locked(conn, account, symbol, side, qty, validation_price)
         if not preview["allowed"]:
             raise SystemExit(f"risk rejected: {preview['reason']}")
+        execution = None
         if immediate:
-            _fill_locked(conn, account, symbol, side, qty, price)
+            report = _fill_locked(conn, account, symbol, side, qty, price)
+            execution = report["execution"]
+            status = "partially_filled" if execution["partial"] else "filled"
         oid = _insert_order_locked(
             conn,
             account,
@@ -2019,7 +2289,7 @@ def submit_order(
             qty,
             limit_price,
             status,
-            price if immediate else None,
+            execution["fill_price"] if execution else None,
             ts,
             source,
             request_id,
@@ -2034,6 +2304,16 @@ def submit_order(
             client_order_id=client_order_id,
             order_class=order_class,
         )
+        if execution:
+            conn.execute(
+                "UPDATE orders SET filled_qty=?,commission=?,slippage=? WHERE id=?",
+                (
+                    execution["filled_quantity"],
+                    execution["commission"],
+                    execution["slippage"],
+                    oid,
+                ),
+            )
         if order_class in ("bracket", "oto"):
             _linked_exit_orders_locked(
                 conn,
@@ -2041,7 +2321,7 @@ def submit_order(
                 account,
                 symbol,
                 side,
-                qty,
+                execution["filled_quantity"] if execution else qty,
                 take_profit,
                 stop_loss,
                 "pending" if immediate else "held",
@@ -2050,8 +2330,12 @@ def submit_order(
                 order_class,
             )
         _audit_locked(conn, "order.submit", account, source, request_id, intent)
-    if status == "filled":
-        print(f"filled #{oid} {side} {qty:g} {symbol} @ {price:.2f}")
+    if status in ("filled", "partially_filled"):
+        print(
+            f"{status} #{oid} {side} "
+            f"{execution['filled_quantity'] if execution else qty:g} "
+            f"{symbol} @ {execution['fill_price'] if execution else price:.2f}"
+        )
     elif status == "canceled":
         print(f"canceled #{oid}: {time_in_force} order was not immediately marketable")
     else:
@@ -2843,6 +3127,7 @@ def adjust_cash(conn, account, amount, source="cli", request_id=None):
             (account, datetime.now(timezone.utc).isoformat(timespec="seconds"), amount),
         )
         _audit_locked(conn, "cash.adjust", account, source, request_id, details)
+        features.record_cash(conn, account, amount)
     verb = "deposited" if amount >= 0 else "withdrew"
     print(f"{verb} {abs(amount):,.2f} — cash now {new_cash:,.2f}")
 
@@ -2882,6 +3167,7 @@ def create_account(
             "INSERT INTO cashflow(account,ts,amount) VALUES(?,?,?)", (name, ts, cash)
         )
         conn.execute("INSERT INTO risk_settings(account) VALUES(?)", (name,))
+        conn.execute("INSERT INTO execution_settings(account) VALUES(?)", (name,))
         if (
             make_default
             and not conn.execute(
@@ -2891,6 +3177,7 @@ def create_account(
             conn.execute("INSERT INTO config VALUES('default_account',?)", (name,))
             made_default = True
         _audit_locked(conn, "account.create", name, source, request_id, details)
+        features.record_cash(conn, name, cash, "account.open")
     return made_default
 
 
@@ -2922,9 +3209,13 @@ def rename_account(conn, old, new, source="cli", request_id=None):
             ("corporate_sync", "account"),
             ("watchlists", "account"),
             ("option_instructions", "account"),
+            ("execution_settings", "account"),
+            ("journal_entries", "account"),
+            ("equity_peaks", "account"),
         ]:
             conn.execute(f"UPDATE {tbl} SET {col}=? WHERE {col}=?", (new, old))
         conn.execute("DELETE FROM accounts WHERE name=?", (old,))
+        features.ensure_opening_ledger(conn, new)
         conn.execute(
             "UPDATE config SET value=? WHERE key='default_account' AND value=?",
             (new, old),
@@ -2948,11 +3239,16 @@ def wipe_account(conn, name, reset_cash=None, source="cli", request_id=None):
             return
         if not conn.execute("SELECT 1 FROM accounts WHERE name=?", (name,)).fetchone():
             raise SystemExit(f"no account '{name}'")
+        if reset_cash is None:
+            features.close_ledger_account(conn, name)
         conn.execute("DELETE FROM positions WHERE account=?", (name,))
         conn.execute("DELETE FROM orders WHERE account=?", (name,))
         conn.execute("DELETE FROM corporate_actions WHERE account=?", (name,))
         conn.execute("DELETE FROM corporate_sync WHERE account=?", (name,))
         conn.execute("DELETE FROM option_instructions WHERE account=?", (name,))
+        conn.execute("DELETE FROM journal_entries WHERE account=?", (name,))
+        conn.execute("DELETE FROM execution_settings WHERE account=?", (name,))
+        conn.execute("DELETE FROM equity_peaks WHERE account=?", (name,))
         conn.execute(
             "DELETE FROM watchlist_symbols WHERE watchlist_id IN"
             " (SELECT id FROM watchlists WHERE account=?)",
@@ -2989,6 +3285,7 @@ def wipe_account(conn, name, reset_cash=None, source="cli", request_id=None):
                 "INSERT INTO cashflow(account, ts, amount) VALUES(?,?,?)",
                 (name, ts, reset_cash),
             )
+            features.reconcile(conn, name, repair=True)
         _audit_locked(conn, action, name, source, request_id, details)
     if reset_cash is None:
         print(f"deleted '{name}'")
@@ -3215,7 +3512,7 @@ def tick(conn, price_fn=live_price):
                 print(f"#{oid} {current['symbol']}: price {price:.2f}, {description}")
                 continue
             try:
-                _fill_locked(
+                report = _fill_locked(
                     conn,
                     current["account"],
                     current["symbol"],
@@ -3239,17 +3536,38 @@ def tick(conn, price_fn=live_price):
                 )
                 print(f"rejected #{oid}: {reason}")
                 continue
-            conn.execute(
-                "UPDATE orders SET status='filled',filled_price=? WHERE id=? AND status='pending'",
-                (_price(price), oid),
+            execution = report["execution"]
+            terminal_status = (
+                "partially_filled" if execution["partial"] else "filled"
             )
+            conn.execute(
+                "UPDATE orders SET status=?,filled_price=?,filled_qty=?,"
+                "commission=?,slippage=? WHERE id=? AND status='pending'",
+                (
+                    terminal_status,
+                    execution["fill_price"],
+                    execution["filled_quantity"],
+                    execution["commission"],
+                    execution["slippage"],
+                    oid,
+                ),
+            )
+            if execution["partial"]:
+                conn.execute(
+                    "UPDATE orders SET qty=? WHERE parent_id=? AND status='held'",
+                    (execution["filled_quantity"], oid),
+                )
             _linked_after_fill_locked(conn, current)
             _audit_locked(
                 conn,
                 "order.fill",
                 current["account"],
                 "engine",
-                details={"order_id": oid, "filled_price": price},
+                details={
+                    "order_id": oid,
+                    "filled_price": execution["fill_price"],
+                    "filled_quantity": execution["filled_quantity"],
+                },
             )
         if should_fill:
             print(
@@ -4006,12 +4324,14 @@ def healthcheck(conn):
     backup = conn.execute(
         "SELECT value FROM config WHERE key='last_migration_backup'"
     ).fetchone()
+    feature_status = features.feature_health(conn)
     healthy = (
         integrity == "ok"
         and schema_version == SCHEMA_VERSION
         and logical["total"] == 0
         and bool(foreign_keys)
         and guard_count > 0
+        and feature_status["valid"]
     )
     return {
         "status": "ok" if healthy else "degraded",
@@ -4020,6 +4340,7 @@ def healthcheck(conn):
         "foreign_keys": bool(foreign_keys),
         "data_guards": guard_count,
         "fixed_precision": {"money": 2, "price": 6, "quantity": 8},
+        "features": feature_status,
         "journal_mode": conn.execute("PRAGMA journal_mode").fetchone()[0],
         "schema_version": schema_version,
         "expected_schema_version": SCHEMA_VERSION,
@@ -4487,6 +4808,14 @@ CLI_COMMAND_TREE = {
         "tick",
         "doctor",
         "backup",
+        "ledger",
+        "execution",
+        "journal",
+        "automation",
+        "strategy",
+        "broker",
+        "security",
+        "serve",
     ],
 }
 
@@ -4710,6 +5039,14 @@ def _build_parser():
     risk.add_argument("--max-leverage", type=float)
     risk.add_argument("--max-order", type=float)
     risk.add_argument("--clear-max-order", action="store_true")
+    risk.add_argument("--max-daily-loss", type=float)
+    risk.add_argument("--max-drawdown", type=float)
+    risk.add_argument("--max-symbol-exposure", type=float)
+    risk.add_argument("--max-concentration", type=float)
+    risk.add_argument("--clear-daily-loss", action="store_true")
+    risk.add_argument("--clear-drawdown", action="store_true")
+    risk.add_argument("--clear-symbol-exposure", action="store_true")
+    risk.add_argument("--clear-concentration", action="store_true")
     actions = sub.add_parser("actions")
     actions.add_argument("-a", "--account")
     audit = sub.add_parser("audit")
@@ -4718,7 +5055,108 @@ def _build_parser():
     export = sub.add_parser("export")
     export.add_argument("-a", "--account")
     export.add_argument("--limit", type=int, default=5000)
-    sub.add_parser("backup")
+    backup = sub.add_parser("backup")
+    backup_sub = backup.add_subparsers(dest="backup_cmd")
+    backup_sub.add_parser("create")
+    backup_sub.add_parser("list")
+    prune = backup_sub.add_parser("prune")
+    prune.add_argument("--keep", type=int, default=10)
+    restore = backup_sub.add_parser("restore")
+    restore.add_argument("path")
+    restore.add_argument("--yes", action="store_true")
+
+    ledger = sub.add_parser("ledger")
+    ledger_sub = ledger.add_subparsers(dest="ledger_cmd", required=True)
+    ledger_sub.add_parser("balances").add_argument("-a", "--account")
+    reconcile_parser = ledger_sub.add_parser("reconcile")
+    reconcile_parser.add_argument("-a", "--account")
+    reconcile_parser.add_argument("--repair", action="store_true")
+    entries = ledger_sub.add_parser("entries")
+    entries.add_argument("-a", "--account")
+    entries.add_argument("--limit", type=int, default=100)
+
+    execution = sub.add_parser("execution")
+    execution_sub = execution.add_subparsers(dest="execution_cmd", required=True)
+    execution_sub.add_parser("get").add_argument("-a", "--account")
+    execution_set = execution_sub.add_parser("set")
+    execution_set.add_argument("-a", "--account")
+    execution_set.add_argument("--commission-bps", type=float)
+    execution_set.add_argument("--slippage-bps", type=float)
+    execution_set.add_argument("--max-fill-quantity", type=float)
+    execution_set.add_argument("--liquidity-fraction", type=float)
+    execution_set.add_argument("--clear-max-fill", action="store_true")
+    execution_preview = execution_sub.add_parser("preview")
+    execution_preview.add_argument("side", choices=["buy", "sell"])
+    execution_preview.add_argument("quantity", type=float)
+    execution_preview.add_argument("price", type=float)
+    execution_preview.add_argument("-a", "--account")
+
+    journal = sub.add_parser("journal")
+    journal_sub = journal.add_subparsers(dest="journal_cmd", required=True)
+    journal_add = journal_sub.add_parser("add")
+    journal_add.add_argument("title")
+    journal_add.add_argument("--body", default="")
+    journal_add.add_argument("--tags", default="")
+    journal_add.add_argument("--symbol")
+    journal_add.add_argument("--order-id", type=int)
+    journal_add.add_argument("--attachment")
+    journal_add.add_argument("-a", "--account")
+    journal_list = journal_sub.add_parser("list")
+    journal_list.add_argument("-a", "--account")
+    journal_list.add_argument("--limit", type=int, default=100)
+    journal_list.add_argument("--tag")
+    journal_list.add_argument("--symbol")
+    journal_sub.add_parser("attribution").add_argument("-a", "--account")
+    journal_delete = journal_sub.add_parser("delete")
+    journal_delete.add_argument("entry_id", type=int)
+    journal_delete.add_argument("-a", "--account")
+
+    automation = sub.add_parser("automation")
+    automation_sub = automation.add_subparsers(dest="automation_cmd", required=True)
+    automation_add = automation_sub.add_parser("add")
+    automation_add.add_argument("name")
+    automation_add.add_argument("action", choices=["tick", "backup", "reconcile"])
+    automation_add.add_argument("--interval-seconds", type=int, required=True)
+    automation_add.add_argument("--account")
+    automation_sub.add_parser("list")
+    automation_sub.add_parser("run-due")
+    automation_history = automation_sub.add_parser("history")
+    automation_history.add_argument("--limit", type=int, default=100)
+
+    strategy = sub.add_parser("strategy")
+    strategy_sub = strategy.add_subparsers(dest="strategy_cmd", required=True)
+    walk_forward = strategy_sub.add_parser("walk-forward")
+    walk_forward.add_argument("symbol")
+
+    broker = sub.add_parser("broker")
+    broker_sub = broker.add_subparsers(dest="broker_cmd", required=True)
+    broker_export_parser = broker_sub.add_parser("export")
+    broker_export_parser.add_argument("broker", choices=["generic", "alpaca", "ibkr"])
+    broker_export_parser.add_argument("-a", "--account")
+    broker_import_parser = broker_sub.add_parser("import")
+    broker_import_parser.add_argument("broker", choices=["generic", "alpaca", "ibkr"])
+    broker_import_parser.add_argument("path")
+    broker_import_parser.add_argument("-a", "--account")
+
+    security = sub.add_parser("security")
+    security_sub = security.add_subparsers(dest="security_cmd", required=True)
+    encrypt = security_sub.add_parser("encrypt-copy")
+    encrypt.add_argument("output")
+    encrypt.add_argument(
+        "--password-env", default="PAPERTRADE_ENCRYPTION_PASSWORD"
+    )
+    decrypt = security_sub.add_parser("decrypt-copy")
+    decrypt.add_argument("input")
+    decrypt.add_argument("output")
+    decrypt.add_argument(
+        "--password-env", default="PAPERTRADE_ENCRYPTION_PASSWORD"
+    )
+
+    serve = sub.add_parser("serve")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8765)
+    serve.add_argument("--token-env", default="PAPERTRADE_API_TOKEN")
+    serve.add_argument("--allow-mutations", action="store_true")
     sub.add_parser("doctor")
     dash = sub.add_parser("dash")
     dash.add_argument("-a", "--account")
@@ -4876,6 +5314,30 @@ def _run_cli(args):
             if len(pair) != 6:
                 raise SystemExit("forex pair must look like USD/EUR")
             result = latest_quote(f"{pair}=X")
+        print(json.dumps(result, indent=2))
+        return
+    if args.cmd == "serve":
+        token = os.environ.get(args.token_env, "")
+        features.serve_api(db, args.host, args.port, token, args.allow_mutations)
+        return
+    if args.cmd == "security":
+        password = os.environ.get(args.password_env, "")
+        if args.security_cmd == "encrypt-copy":
+            result = features.encrypt_database_copy(DB, args.output, password)
+        else:
+            result = features.decrypt_database_copy(args.input, args.output, password)
+        print(json.dumps(result, indent=2))
+        return
+    if args.cmd == "backup" and args.backup_cmd == "restore":
+        if not args.yes:
+            raise SystemExit("backup restore requires --yes")
+        current = db()
+        try:
+            safety = backup_database(current)
+        finally:
+            current.close()
+        result = features.restore_backup(DB, args.path, SCHEMA_VERSION)
+        result["pre_restore_backup"] = os.path.basename(safety)
         print(json.dumps(result, indent=2))
         return
 
@@ -5114,10 +5576,263 @@ def _run_cli(args):
                 args.max_leverage,
                 args.max_order,
             )
-            if any(value is not None for value in changes) or args.clear_max_order:
-                set_risk_limits(conn, account, *changes, args.clear_max_order)
+            expanded = (
+                args.max_daily_loss,
+                args.max_drawdown,
+                args.max_symbol_exposure,
+                args.max_concentration,
+            )
+            clear_expanded = (
+                args.clear_daily_loss,
+                args.clear_drawdown,
+                args.clear_symbol_exposure,
+                args.clear_concentration,
+            )
+            if (
+                any(value is not None for value in changes + expanded)
+                or args.clear_max_order
+                or any(clear_expanded)
+            ):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    set_risk_limits(
+                        conn,
+                        account,
+                        *changes,
+                        clear_max_order=args.clear_max_order,
+                        max_daily_loss=args.max_daily_loss,
+                        max_drawdown=args.max_drawdown,
+                        max_symbol_exposure=args.max_symbol_exposure,
+                        max_concentration=args.max_concentration,
+                        clear_daily_loss=args.clear_daily_loss,
+                        clear_drawdown=args.clear_drawdown,
+                        clear_symbol_exposure=args.clear_symbol_exposure,
+                        clear_concentration=args.clear_concentration,
+                    )
+                print(json.dumps(risk_limits(conn, account), indent=2))
             else:
                 print(json.dumps(risk_limits(conn, account), indent=2))
+        elif args.cmd == "ledger":
+            account = resolve_account(conn, args.account)
+            if args.ledger_cmd == "balances":
+                result = features.ledger_balance(conn, account)
+            elif args.ledger_cmd == "reconcile":
+                with writing(conn):
+                    result = features.reconcile(conn, account, args.repair)
+            else:
+                rows = conn.execute(
+                    "SELECT t.id,t.ts,t.kind,t.reference_type,t.reference_id,"
+                    "e.book,e.amount,e.commodity,e.units,e.price"
+                    " FROM ledger_transactions t JOIN ledger_entries e"
+                    " ON e.transaction_id=t.id WHERE t.account=?"
+                    " ORDER BY t.id DESC,e.id LIMIT ?",
+                    (account, max(1, min(args.limit, 5000))),
+                ).fetchall()
+                result = [
+                    {
+                        "transaction_id": row[0],
+                        "timestamp": row[1],
+                        "kind": row[2],
+                        "reference_type": row[3],
+                        "reference_id": row[4],
+                        "book": row[5],
+                        "amount": row[6],
+                        "commodity": row[7],
+                        "units": row[8],
+                        "price": row[9],
+                    }
+                    for row in rows
+                ]
+            print(json.dumps(result, indent=2))
+        elif args.cmd == "execution":
+            account = resolve_account(conn, args.account)
+            if args.execution_cmd == "get":
+                result = features.execution_settings(conn, account)
+            elif args.execution_cmd == "set":
+                with writing(conn):
+                    result = features.set_execution_settings(
+                        conn,
+                        account,
+                        args.commission_bps,
+                        args.slippage_bps,
+                        args.max_fill_quantity,
+                        args.liquidity_fraction,
+                        args.clear_max_fill,
+                    )
+            else:
+                result = features.realistic_fill(
+                    conn, account, args.side, args.quantity, args.price
+                )
+            print(json.dumps(result, indent=2))
+        elif args.cmd == "journal":
+            account = resolve_account(conn, args.account)
+            if args.journal_cmd == "add":
+                with writing(conn):
+                    entry_id = features.journal_add(
+                        conn,
+                        account,
+                        args.title,
+                        args.body,
+                        args.tags.split(","),
+                        args.symbol,
+                        args.order_id,
+                        args.attachment,
+                    )
+                result = {"id": entry_id}
+            elif args.journal_cmd == "list":
+                result = features.journal_list(
+                    conn, account, args.limit, args.tag, args.symbol
+                )
+            elif args.journal_cmd == "attribution":
+                result = features.performance_attribution(conn, account)
+            else:
+                with writing(conn):
+                    features.journal_delete(conn, account, args.entry_id)
+                result = {"deleted": args.entry_id}
+            print(json.dumps(result, indent=2))
+        elif args.cmd == "automation":
+            if args.automation_cmd == "add":
+                payload = {"account": args.account} if args.account else {}
+                with writing(conn):
+                    features.schedule_add(
+                        conn,
+                        args.name,
+                        args.action,
+                        args.interval_seconds,
+                        payload,
+                    )
+                result = {"created": args.name}
+            elif args.automation_cmd == "list":
+                result = features.schedule_list(conn)
+            elif args.automation_cmd == "history":
+                result = [
+                    {
+                        "id": row[0],
+                        "job_id": row[1],
+                        "started": row[2],
+                        "finished": row[3],
+                        "status": row[4],
+                        "output": json.loads(row[5]) if row[5] else None,
+                        "error": row[6],
+                    }
+                    for row in conn.execute(
+                        "SELECT id,job_id,started,finished,status,output,error"
+                        " FROM automation_runs ORDER BY id DESC LIMIT ?",
+                        (max(1, min(args.limit, 1000)),),
+                    )
+                ]
+            else:
+                def execute_automation(action, payload):
+                    if action == "tick":
+                        tick(conn)
+                        return {"ticked": True}
+                    if action == "backup":
+                        return {"backup": os.path.basename(backup_database(conn))}
+                    account = resolve_account(conn, payload.get("account"))
+                    with writing(conn):
+                        return features.reconcile(conn, account, repair=True)
+
+                result = features.run_due(conn, execute_automation)
+            print(json.dumps(result, indent=2))
+        elif args.cmd == "strategy":
+            print(
+                json.dumps(features.walk_forward_sma(args.symbol), indent=2)
+            )
+        elif args.cmd == "broker":
+            account = resolve_account(conn, args.account)
+            if args.broker_cmd == "export":
+                print(features.broker_export(conn, account, args.broker), end="")
+            else:
+                path = os.path.abspath(os.path.expanduser(args.path))
+                if not os.path.isfile(path):
+                    raise SystemExit("broker import file does not exist")
+                if os.path.getsize(path) > 20_000_000:
+                    raise SystemExit("broker import is limited to 20 MB")
+                with open(path, encoding="utf-8-sig", newline="") as handle:
+                    content = handle.read()
+
+                def imported_fill(
+                    imported_account,
+                    symbol,
+                    side,
+                    quantity,
+                    price,
+                    timestamp,
+                    commission,
+                ):
+                    with writing(conn):
+                        report = _fill_locked(
+                            conn,
+                            imported_account,
+                            symbol,
+                            side,
+                            quantity,
+                            price,
+                            enforce_risk=False,
+                        )
+                        imported_commission = _money(commission)
+                        if imported_commission:
+                            balances = conn.execute(
+                                "SELECT cash,realized FROM accounts WHERE name=?",
+                                (imported_account,),
+                            ).fetchone()
+                            if balances[0] < imported_commission:
+                                raise SystemExit(
+                                    "insufficient cash for imported commission"
+                                )
+                            conn.execute(
+                                "UPDATE accounts SET cash=?,realized=? WHERE name=?",
+                                (
+                                    _money(balances[0] - imported_commission),
+                                    _money(balances[1] - imported_commission),
+                                    imported_account,
+                                ),
+                            )
+                            features.post_ledger(
+                                conn,
+                                imported_account,
+                                "commission",
+                                (
+                                    {
+                                        "book": "asset:cash",
+                                        "amount": -imported_commission,
+                                    },
+                                    {
+                                        "book": "expense:commission",
+                                        "amount": imported_commission,
+                                    },
+                                ),
+                                reference_type="symbol",
+                                reference_id=symbol,
+                            )
+                        oid = _insert_order_locked(
+                            conn,
+                            imported_account,
+                            symbol,
+                            side,
+                            quantity,
+                            None,
+                            "filled",
+                            report["execution"]["fill_price"],
+                            timestamp or datetime.now(timezone.utc).isoformat(
+                                timespec="seconds"
+                            ),
+                            f"import:{args.broker}",
+                            None,
+                        )
+                        conn.execute(
+                            "UPDATE orders SET commission=? WHERE id=?",
+                            (imported_commission, oid),
+                        )
+
+                result = features.broker_import(
+                    conn,
+                    account,
+                    content,
+                    args.broker,
+                    imported_fill,
+                    os.path.basename(path),
+                )
+                print(json.dumps(result, indent=2))
         elif args.cmd == "activity":
             account = resolve_account(conn, args.account)
             print(
@@ -5156,7 +5871,13 @@ def _run_cli(args):
                 end="",
             )
         elif args.cmd == "backup":
-            print(backup_database(conn))
+            if args.backup_cmd in (None, "create"):
+                print(backup_database(conn))
+            elif args.backup_cmd == "list":
+                print(json.dumps(features.backup_inventory(DB), indent=2))
+            else:
+                removed = features.prune_backups(DB, args.keep)
+                print(json.dumps({"removed": removed, "kept": args.keep}, indent=2))
         elif args.cmd == "doctor":
             print(json.dumps(healthcheck(conn), indent=2))
         elif args.cmd == "cancel":

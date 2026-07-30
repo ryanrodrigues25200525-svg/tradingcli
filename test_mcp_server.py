@@ -72,7 +72,7 @@ required = {
 }
 names = set(mcp.mcp._tool_manager._tools)
 assert required <= names, required - names
-assert len(names) == 74, names
+assert len(names) == 86, names
 
 created = mcp.account_create("agent", 10_000, idempotency_key="create-1", agent="codex")
 assert created.startswith("created")
@@ -147,11 +147,11 @@ assert json.loads(mcp.account_activity("agent"))
 assert json.loads(mcp.trading_calendar("2026-07-01", "2026-07-06"))
 
 health = json.loads(mcp.healthcheck())
-assert health["status"] == "ok" and health["schema_version"] == 4
+assert health["status"] == "ok" and health["schema_version"] == 5
 clock = json.loads(mcp.market_status())
 assert clock["market"] == "NYSE" and clock["status"] in ("open", "closed")
 catalog = json.loads(mcp.mcp_catalog())
-assert catalog["profile"] == "full" and catalog["tool_count"] == 74
+assert catalog["profile"] == "full" and catalog["tool_count"] == 86
 
 conn = mcp.pt.db()
 with mcp.pt.writing(conn):

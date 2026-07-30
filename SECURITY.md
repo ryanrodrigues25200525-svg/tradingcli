@@ -19,6 +19,15 @@ permissions on the database and SQLite sidecars. Backups are stored in
 Automatic pre-migration snapshots are stored in
 `~/.papertrade.db.migrations` with the same owner-only permissions.
 
+`security encrypt-copy` creates authenticated AES-GCM encrypted portable
+snapshots using a password read from an environment variable. It does not
+silently decrypt the live database or claim SQLCipher compatibility.
+
+The optional HTTP API binds only to loopback addresses and requires a bearer
+token of at least 24 characters. It is not a multi-user service, has no TLS
+termination, and must not be exposed through a public reverse proxy without a
+separate production authentication and transport-security layer.
+
 Anyone able to run the CLI or MCP server as the same operating-system user can
 access this data. The stdio MCP server is not an authenticated network service
 and must not be exposed directly to untrusted users.

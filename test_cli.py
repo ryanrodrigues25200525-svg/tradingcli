@@ -125,7 +125,7 @@ activity = json.loads(run("activity", "--json").stdout)
 assert any(event["type"] == "order" for event in activity)
 
 doctor = json.loads(run("doctor", "--json").stdout)
-assert doctor["status"] == "ok" and doctor["schema_version"] == 4
+assert doctor["status"] == "ok" and doctor["schema_version"] == 5
 calendar = json.loads(
     run("calendar", "--start", "2026-07-01", "--end", "2026-07-06", "--json").stdout
 )

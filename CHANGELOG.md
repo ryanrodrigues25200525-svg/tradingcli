@@ -2,6 +2,29 @@
 
 All notable changes are documented here.
 
+## [0.4.0] - 2026-07-31
+
+### Added
+
+- Append-only double-entry ledger, opening-balance migration, reconciliation,
+  and symbol-level performance attribution.
+- Commission, adverse-slippage, liquidity, and partial-fill simulation.
+- Daily-loss, drawdown, symbol-exposure, and concentration risk limits.
+- Backup inventory, restore safety backup, and retention workflows.
+- Provider chaining with static-price failover and TTL caching.
+- Chronological train/test SMA walk-forward research.
+- Persistent automation jobs and execution history.
+- Trade journal with tags, symbol/order links, and attachment hashes.
+- Generic, Alpaca, and IBKR CSV import/export.
+- Authenticated encrypted database snapshots and a bearer-authenticated,
+  loopback-only HTTP API.
+- Twelve new canonical MCP tools for operational features.
+
+### Changed
+
+- Schema version is now 5 and migrations backfill balanced opening ledgers.
+- MCP catalogs now expose 63 core, 79 advanced, and 86 full tools.
+
 ## [0.3.0] - 2026-07-30
 
 ### Added
