@@ -21,12 +21,14 @@ terminal dashboard · backtesting · alerts · automation · MCP
 
 ## 🖥️ Screenshots
 
-| Paper-trading workflow | Offline report and benchmark |
+| All portfolios | Position detail |
 | --- | --- |
-| ![TradingCLI quickstart terminal](docs/images/cli-quickstart.svg) | ![TradingCLI simulation report and benchmark](docs/images/cli-report.svg) |
+| ![TradingCLI dashboard listing every paper portfolio](docs/images/cli-portfolios.png) | ![TradingCLI detail view showing per-position P&L](docs/images/cli-positions.png) |
 
-The captures use a disposable demo database and deterministic static prices;
-they contain no real portfolio or credential data.
+![TradingCLI backtesting and graphs view](docs/images/cli-backtest.png)
+
+The captures come from a local paper-trading database; they contain no real
+portfolio or credential data.
 
 ## ✨ Highlights
 
