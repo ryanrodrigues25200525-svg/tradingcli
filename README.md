@@ -19,6 +19,34 @@ terminal dashboard · backtesting · alerts · automation · MCP
 > TradingCLI is strictly a **local paper-trading simulator**. It never routes
 > orders to a live broker and is not a source of personalized financial advice.
 
+## 🧠 What it actually is
+
+TradingCLI gives you a **fake brokerage account that lives in one file on your
+own machine**. You place orders against it, and it fills them using real market
+prices from Yahoo Finance. There is no signup, no API key, and no path in the
+code that reaches a real broker.
+
+```text
+        you  ·  or your AI agent
+                    │
+                    ▼
+     tradingcli  (dashboard · commands · MCP server)
+                    │
+       ┌────────────┴────────────┐
+       ▼                         ▼
+ ~/.papertrade.db          Yahoo Finance
+ accounts, orders,         prices only,
+ positions, ledger         read-only
+```
+
+Three ways to drive it — they all share the same database:
+
+| | How you start it | Best for |
+| --- | --- | --- |
+| 🖥️ **Dashboard** | `tradingcli` | Watching portfolios update live |
+| ⌨️ **Commands** | `tradingcli buy AAPL 5` | Scripting, automation, one-off actions |
+| 🤖 **MCP server** | `tradingcli-mcp` | Letting Claude or another agent trade — see [AI agents](#ai-agents) |
+
 ## 🖥️ Screenshots
 
 | All portfolios | Position detail |
@@ -52,6 +80,7 @@ portfolio or credential data.
 - [Orders, options and market data](#orders-options-and-market-data)
 - [Operations and simulation lab](#operations-and-simulation-lab)
 - [MCP server](#mcp-server)
+- [AI agents: a local alternative to Alpaca paper trading](#ai-agents)
 - [Configuration](#configuration)
 - [Development and verification](#development-and-verification)
 
@@ -123,26 +152,27 @@ tradingcli --schema
 
 ## 📊 Dashboard and research
 
-Press `g` in the dashboard to open **Backtesting & Graphs**. It shows the
-selected portfolio's live performance curve beside a `backtesting.py`
-current-holdings backtest, including return, CAGR, volatility, Sharpe,
-Sortino, costs, and maximum drawdown. The backtest universe is read directly
-from that account's open positions in SQLite; another account's tickers are
-never mixed in. Choose `6m`, `1y`, `2y`, `5y`, `10y`, `max`, or an exact
-number of days when opening the view; pressing Enter requests five years.
-Reported CAGR uses the actual elapsed calendar interval.
+Press `g` in the dashboard to open **Backtesting & Graphs**. It puts the
+selected portfolio's live performance curve next to a `backtesting.py`
+backtest of the same holdings, reporting return, CAGR, volatility, Sharpe,
+Sortino, costs, and maximum drawdown.
 
-The backtest asks a specific retrospective question: how today's open
-quantities and current cash would have performed if held unchanged over the
-selected history. Because today's holdings are known in advance, it has
-look-ahead and survivorship bias and is not an out-of-sample strategy test.
-Adjusted daily Yahoo prices are used. Options are clearly reported as skipped
-because reliable point-in-time option-chain history is unavailable; futures
-use continuous series without roll costs.
+- **The universe is that account only.** Tickers come straight from that
+  account's open positions in SQLite; another account's names never leak in.
+- **Pick a window on open:** `6m`, `1y`, `2y`, `5y`, `10y`, `max`, or an exact
+  number of days. Enter requests five years. CAGR uses the real elapsed
+  calendar interval, not the requested one.
+- **Returns are time-weighted,** so deposits and withdrawals cannot masquerade
+  as trading gains or losses.
 
-Current-performance returns are time-weighted, so deposits and withdrawals do
-not masquerade as trading gains or losses. Live marks and historical symbols
-load concurrently, and the graph/backtest pair reuses overlapping history.
+> [!WARNING]
+> **Read the backtest for what it is.** It answers one narrow question: how
+> today's open quantities and current cash *would have* performed if held
+> unchanged over the chosen history. Because today's holdings are already known,
+> it carries look-ahead and survivorship bias — it is **not** an out-of-sample
+> strategy test. It uses adjusted daily Yahoo prices, skips options (reliable
+> point-in-time option-chain history does not exist) and treats futures as
+> continuous series with no roll costs.
 
 <a id="orders-options-and-market-data"></a>
 
@@ -308,14 +338,18 @@ Start the MCP server over standard input/output:
 python3 mcp_server.py
 ```
 
-The server defaults to a focused 63-tool `core` catalog. It uses canonical
-names, includes `portfolio_backtest`, order preview and lifecycle management,
-positions, watchlists, market data, health checks, and backups, and leaves
-destructive account deletion/reset out of the default agent surface. Core
-responses use one compact JSON contract: `{"ok":true,"data":...}` or
-`{"ok":false,"error":{"code":"...","message":"..."}}`.
+The server defaults to a focused **63-tool `core` catalog**: order preview and
+lifecycle management, positions, watchlists, market data, `portfolio_backtest`,
+health checks, and backups. Destructive account deletion and reset are
+deliberately left out of that default surface. Every core response uses one
+compact JSON contract:
 
-Select a broader catalog before starting the server when an agent needs it:
+```json
+{"ok": true,  "data": {}}
+{"ok": false, "error": {"code": "...", "message": "..."}}
+```
+
+Pick a broader catalog before starting the server if an agent needs one:
 
 ```bash
 PAPERTRADE_MCP_PROFILE=advanced tradingcli-mcp  # 79 canonical tools
@@ -338,6 +372,63 @@ forced to owner-only `0600`; the backup directory is `0700` and backups are
 `0600`. Set `PAPERTRADE_DB` to use a different database path. Set
 `PAPERTRADE_MARKET_TIMEOUT` to change the default 15-second timeout used by
 historical-data requests.
+
+<a id="ai-agents"></a>
+
+## 🧪 AI agents: a local alternative to Alpaca paper trading
+
+The usual way to let an AI agent practise trading is a hosted paper-trading
+API such as Alpaca's: you sign up, mint keys, and every order the agent places
+is a network call to someone else's server. TradingCLI does the same job with a
+local SQLite file and a stdio MCP server.
+
+### Why that matters for an agent
+
+| | Hosted paper API | TradingCLI |
+| --- | --- | --- |
+| **Getting started** | Account signup, API keys the agent must be trusted with | `pip install .` — no account, no keys, no secrets to leak |
+| **Where state lives** | A vendor's servers | `~/.papertrade.db` on your disk, owner-only `0600` |
+| **When the network dies** | The agent's run dies with it | Orders still fill; only fresh prices need the network |
+| **Rate limits** | Yes — a fast agent loop hits them | None; it is a local database write |
+| **Reproducibility** | Live prices, so a run can never be replayed exactly | Pin prices with `PAPERTRADE_PRICE_FILE` or `PAPERTRADE_STATIC_PRICES` and replay a run byte-for-byte |
+| **Number of accounts** | Constrained by the provider | As many as you want, in one database |
+| **Blast radius** | A misconfigured key can point at a live endpoint | There is no live order path in the codebase |
+
+### The safety rails an agent gets
+
+- **A deliberately narrow default surface.** The `core` MCP profile exposes 63
+  tools and leaves account deletion and reset out entirely. You opt into the
+  destructive ones with `PAPERTRADE_MCP_PROFILE=advanced`.
+- **One response contract.** Every core tool returns `{"ok":true,"data":...}`
+  or `{"ok":false,"error":{...}}`, so an agent never has to parse prose.
+- **Idempotency keys and agent attribution.** A retrying agent — or several
+  agents in parallel MCP processes — cannot double-fill the same order.
+- **Risk limits enforced in the engine, not in the prompt.** Daily loss,
+  drawdown, per-symbol exposure and concentration caps reject the order rather
+  than trusting the model to behave.
+- **Realistic costs, so the agent does not learn on free fills.** Turn on
+  commissions, slippage and liquidity participation with `execution set`.
+- **A full audit trail.** Every fill lands in an append-only double-entry
+  ledger you can reconcile, plus a journal with per-trade attribution.
+
+### Getting an agent trading
+
+```bash
+tradingcli-mcp                                  # core profile, 63 tools
+PAPERTRADE_DB=./agent-sandbox.db tradingcli-mcp # give the agent its own database
+```
+
+Point your MCP client at that command. To keep an agent's experiments away from
+your own portfolios, give it a separate `PAPERTRADE_DB` — the two never see
+each other. When you want the results elsewhere, `tradingcli broker export
+alpaca` writes Alpaca-shaped fill CSVs.
+
+> [!NOTE]
+> **What this deliberately is not.** Yahoo Finance is not an exchange-grade
+> feed: there is no order-book depth and no tick tape. Fills are modelled, not
+> matched against a real queue. This is a place for an agent to learn a
+> strategy and for you to audit its behaviour — moving anything to live capital
+> is a separate, deliberate step that TradingCLI does not perform.
 
 <a id="configuration"></a>
 
