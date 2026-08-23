@@ -10,3 +10,8 @@ __pycache__/
 *.db-shm
 *.db-wal
 
+
+# Python env
+.venv/
+venv/
+.env

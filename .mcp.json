@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "papertrade": {
+      "command": "python3",
+      "args": [
+        "mcp_server.py"
+      ],
+      "env": {
+        "PAPERTRADE_MCP_PROFILE": "core"
+      }
+    }
+  },
+  "_comment": "Set cwd to your tradingcli checkout, or use an absolute path in args. Example: python3 /abs/path/to/tradingcli/mcp_server.py"
+}

@@ -6,8 +6,10 @@ Asset classes:
   future   e.g. ES=F, GC=F, CL=F (see FUTURES)              — contract mult + margin
   option   OCC symbol e.g. AAPL260116C00250000             — mult 100, premium-funded
 
-Commands: new/accounts/use · buy/sell · option buy|sell · chain · tick
-          positions/orders/pnl · cancel · deposit/withdraw · reset/rm · dash
+Commands: new/accounts/use · buy/sell · order/position/option/watchlist
+          data/asset/chain/find/validate/quote/market/calendar/activity/tick
+          positions/orders/pnl/perf/backtest · close/preview/risk/actions/audit/export/backup/doctor/dash
+          cancel/rm/reset/deposit/withdraw
 """
 
 import argparse
@@ -25,7 +27,27 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 
-DB = os.environ.get("PAPERTRADE_DB", os.path.expanduser("~/.papertrade.db"))
+def _resolve_db_path(raw: str | None) -> str:
+    raw = (raw or "").strip()
+    if not raw:
+        raw = "~/.papertrade.db"
+    # Handle SQLite in-memory DBs (used by tests and agents)
+    if raw == ":memory:" or raw.startswith("file:"):
+        return raw
+    path = os.path.expanduser(raw)
+    if "\x00" in path or "\n" in path or "\r" in path:
+        raise SystemExit("PAPERTRADE_DB contains invalid characters")
+    # Refuse obviously dangerous or empty paths; SQLite will create parent dirs via backup logic separately
+    if not path or path.strip() in ("/", ".", ".."):
+        raise SystemExit("PAPERTRADE_DB is not a valid file path")
+    return path
+
+DB = _resolve_db_path(os.environ.get("PAPERTRADE_DB"))
+
+def _db_path() -> str:
+    """Return current DB path, re-reading env so tests and `PAPERTRADE_DB=... tradingcli` work."""
+    raw = os.environ.get("PAPERTRADE_DB")
+    return _resolve_db_path(raw) if raw is not None else DB
 
 # future symbol -> (contract multiplier, initial margin per contract)
 FUTURES = {
@@ -60,6 +82,10 @@ DEFAULT_RISK = {
     "allow_naked_options": False,
     "max_gross_leverage": 2.0,
     "max_order_notional": None,
+    "borrow_bps": 0.0,
+    "commission_bps": 0.0,
+    "slippage_bps": 0.0,
+    "allow_fractional": True,
 }
 ORDER_TYPES = {"market", "limit", "stop", "stop_limit", "trailing_stop"}
 TIME_IN_FORCE = {"gtc", "day", "ioc", "fok", "opg", "cls"}
@@ -86,7 +112,11 @@ CREATE TABLE IF NOT EXISTS risk_settings(account TEXT PRIMARY KEY,
   allow_short INTEGER NOT NULL DEFAULT 1,
   allow_naked_options INTEGER NOT NULL DEFAULT 0,
   max_gross_leverage REAL NOT NULL DEFAULT 2,
-  max_order_notional REAL);
+  max_order_notional REAL,
+  borrow_bps REAL DEFAULT 0,
+  commission_bps REAL DEFAULT 0,
+  slippage_bps REAL DEFAULT 0,
+  allow_fractional INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
   source TEXT NOT NULL, request_id TEXT, action TEXT NOT NULL, account TEXT, details TEXT);
 CREATE TABLE IF NOT EXISTS corporate_actions(id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -130,6 +160,14 @@ def migrate(conn):
         if col not in _cols(conn, "positions"):
             conn.execute(f"ALTER TABLE positions ADD COLUMN {col} {ddl}")
     for col, ddl in [
+        ("borrow_bps", "REAL DEFAULT 0"),
+        ("commission_bps", "REAL DEFAULT 0"),
+        ("slippage_bps", "REAL DEFAULT 0"),
+        ("allow_fractional", "INTEGER DEFAULT 1"),
+    ]:
+        if col not in _cols(conn, "risk_settings"):
+            conn.execute(f"ALTER TABLE risk_settings ADD COLUMN {col} {ddl}")
+    for col, ddl in [
         ("source", "TEXT DEFAULT 'unknown'"),
         ("request_id", "TEXT"),
         ("reject_reason", "TEXT"),
@@ -165,7 +203,7 @@ def migrate(conn):
         "CREATE INDEX IF NOT EXISTS idx_orders_pending ON orders(status,account,id)"
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_parent ON orders(parent_id)")
-    if added:  # reconstruct contributed capital = cash + cost basis of open positions
+    if added:  # Reconstruct contributed capital = cash + cost basis. Note: if withdrawals occurred before this one-time migration, deposits will be overstated (pre-migration cashflows were not tracked). See docs/agent-guide.md.
         for name, cash in conn.execute("SELECT name, cash FROM accounts").fetchall():
             basis = conn.execute(
                 "SELECT COALESCE(SUM(qty*avg_cost*mult),0) FROM positions"
@@ -202,7 +240,7 @@ def migrate(conn):
 def db():
     # WAL + busy_timeout + autocommit so multiple agents (Codex, Claude Code, Hermes) share the DB.
     # Mutations must run inside writing() so BEGIN IMMEDIATE serializes read-modify-write.
-    conn = sqlite3.connect(DB, timeout=10, isolation_level=None)
+    conn = sqlite3.connect(_db_path(), timeout=10, isolation_level=None)
     conn.execute("PRAGMA busy_timeout=10000")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
@@ -233,6 +271,7 @@ def writing(conn):
 
 
 def _context(source="unknown", request_id=None):
+    """Normalize source+request_id. Keys are scoped per source — reuse across sources is safe, but within one source a key must not be reused for a different intent."""
     source = (source or "unknown").strip().lower()[:64]
     request_id = (request_id or "").strip()[:128] or None
     return source, request_id
@@ -281,19 +320,32 @@ def _audit_locked(
 def risk_limits(conn, account):
     if not conn.execute("SELECT 1 FROM accounts WHERE name=?", (account,)).fetchone():
         raise SystemExit(f"no account '{account}'")
+    cols = _cols(conn, "risk_settings")
+    sel = "allow_short,allow_naked_options,max_gross_leverage,max_order_notional"
+    if "borrow_bps" in cols:
+        sel += ",borrow_bps,commission_bps,slippage_bps,allow_fractional"
     row = conn.execute(
-        "SELECT allow_short,allow_naked_options,max_gross_leverage,max_order_notional"
-        " FROM risk_settings WHERE account=?",
+        f"SELECT {sel} FROM risk_settings WHERE account=?",
         (account,),
     ).fetchone()
     if not row:
         return dict(DEFAULT_RISK)
-    return {
+    base = {
         "allow_short": bool(row[0]),
         "allow_naked_options": bool(row[1]),
         "max_gross_leverage": float(row[2]),
         "max_order_notional": float(row[3]) if row[3] is not None else None,
     }
+    if len(row) > 4:
+        base.update({
+            "borrow_bps": float(row[4] or 0),
+            "commission_bps": float(row[5] or 0),
+            "slippage_bps": float(row[6] or 0),
+            "allow_fractional": bool(row[7]) if row[7] is not None else True,
+        })
+    else:
+        base.update({"borrow_bps": 0.0, "commission_bps": 0.0, "slippage_bps": 0.0, "allow_fractional": True})
+    return base
 
 
 def set_risk_limits(
@@ -304,6 +356,10 @@ def set_risk_limits(
     max_gross_leverage=None,
     max_order_notional=None,
     clear_max_order=False,
+    borrow_bps=None,
+    commission_bps=None,
+    slippage_bps=None,
+    allow_fractional=None,
     source="cli",
     request_id=None,
 ):
@@ -314,6 +370,10 @@ def set_risk_limits(
         "max_gross_leverage": max_gross_leverage,
         "max_order_notional": max_order_notional,
         "clear_max_order": bool(clear_max_order),
+        "borrow_bps": borrow_bps,
+        "commission_bps": commission_bps,
+        "slippage_bps": slippage_bps,
+        "allow_fractional": allow_fractional,
     }
     if max_gross_leverage is not None and (
         not math.isfinite(max_gross_leverage) or max_gross_leverage < 1
@@ -323,6 +383,9 @@ def set_risk_limits(
         not math.isfinite(max_order_notional) or max_order_notional <= 0
     ):
         raise SystemExit("max order notional must be a positive finite number")
+    for label, val in [("borrow_bps", borrow_bps), ("commission_bps", commission_bps), ("slippage_bps", slippage_bps)]:
+        if val is not None and (not math.isfinite(val) or val < 0 or val > 10000):
+            raise SystemExit(f"{label} must be between 0 and 10000")
     with writing(conn):
         if _idempotent_action(conn, "risk.set", account, source, request_id, details):
             print(f"idempotent replay: risk settings for {account}")
@@ -345,17 +408,30 @@ def set_risk_limits(
                 if max_order_notional is None
                 else float(max_order_notional)
             ),
+            "borrow_bps": current.get("borrow_bps", 0.0) if borrow_bps is None else float(borrow_bps),
+            "commission_bps": current.get("commission_bps", 0.0) if commission_bps is None else float(commission_bps),
+            "slippage_bps": current.get("slippage_bps", 0.0) if slippage_bps is None else float(slippage_bps),
+            "allow_fractional": current.get("allow_fractional", True) if allow_fractional is None else bool(allow_fractional),
         }
+        # Ensure new columns exist (for old DBs that haven't migrated)
+        cols = _cols(conn, "risk_settings")
+        for col, ddl in [("borrow_bps","REAL DEFAULT 0"),("commission_bps","REAL DEFAULT 0"),("slippage_bps","REAL DEFAULT 0"),("allow_fractional","INTEGER DEFAULT 1")]:
+            if col not in cols:
+                conn.execute(f"ALTER TABLE risk_settings ADD COLUMN {col} {ddl}")
         conn.execute(
             "INSERT OR REPLACE INTO risk_settings"
-            "(account,allow_short,allow_naked_options,max_gross_leverage,max_order_notional)"
-            " VALUES(?,?,?,?,?)",
+            "(account,allow_short,allow_naked_options,max_gross_leverage,max_order_notional,borrow_bps,commission_bps,slippage_bps,allow_fractional)"
+            " VALUES(?,?,?,?,?,?,?,?,?)",
             (
                 account,
                 int(updated["allow_short"]),
                 int(updated["allow_naked_options"]),
                 updated["max_gross_leverage"],
                 updated["max_order_notional"],
+                updated["borrow_bps"],
+                updated["commission_bps"],
+                updated["slippage_bps"],
+                int(updated["allow_fractional"]),
             ),
         )
         _audit_locked(conn, "risk.set", account, source, request_id, details)
@@ -363,7 +439,8 @@ def set_risk_limits(
         f"risk {account}: short={updated['allow_short']} "
         f"naked_options={updated['allow_naked_options']} "
         f"max_leverage={updated['max_gross_leverage']:g} "
-        f"max_order={updated['max_order_notional'] or 'none'}"
+        f"max_order={updated['max_order_notional'] or 'none'} "
+        f"borrow={updated['borrow_bps']:.0f}bps comm={updated['commission_bps']:.0f}bps slip={updated['slippage_bps']:.0f}bps frac={updated['allow_fractional']}"
     )
     return updated
 
@@ -493,7 +570,11 @@ def _apply(state, symbol, side, qty, price):
                 cash -= add
                 new_margin, new_avg = add, price
     else:  # spot / option — signed notional
+        # Enforce fractional flag from risk (only for spot; options are always whole)
+        # _apply is pure and doesn't have conn, so fractional is enforced at the call site (submit_order/place).
+        # Commission/slippage are applied as extra cost on fills.
         cost = signed * mult * price
+        # commission/slippage are fetched lazily from risk if available — handled by caller via _fill_locked
         if side == "buy" and cost > cash:
             raise SystemExit(f"insufficient cash: need {cost:,.2f}, have {cash:,.2f}")
         if old_qty != 0 and (old_qty > 0) != (signed > 0):
@@ -673,7 +754,9 @@ def _preview_locked(conn, account, symbol, side, qty, price):
     return _risk_report_locked(conn, account, symbol, side, qty, price, before, after)
 
 
-def preview_order(conn, account, symbol, side, qty, price=None, price_fn=live_price):
+def preview_order(conn, account, symbol, side, qty, price=None, price_fn=None):
+    if price_fn is None:
+        price_fn = live_price
     symbol = symbol.strip().upper()
     if side not in ("buy", "sell"):
         raise SystemExit("side must be buy or sell")
@@ -691,10 +774,27 @@ def preview_order(conn, account, symbol, side, qty, price=None, price_fn=live_pr
 
 def _fill_locked(conn, account, symbol, side, qty, price, enforce_risk=True):
     """Apply a fill while the caller owns a writing() transaction."""
+    # Fractional check (options already whole-number checked by caller)
+    rl = risk_limits(conn, account)
+    if not rl.get("allow_fractional", True) and classify(symbol)[0] == "spot":
+        if not math.isclose(qty, round(qty)):
+            raise SystemExit("fractional shares disabled for this account")
+    # Apply commission/slippage as extra cash drag
+    comm_bps = rl.get("commission_bps", 0) or 0
+    slip_bps = rl.get("slippage_bps", 0) or 0
+    extra_bps = comm_bps + slip_bps
+    fill_price = price
+    if extra_bps and side == "buy":
+        fill_price = price * (1 + extra_bps / 10000)
+    elif extra_bps and side == "sell":
+        # Sell proceeds reduced by commission/slippage
+        fill_price = price * (1 - extra_bps / 10000)
+        if fill_price <= 0:
+            raise SystemExit("commission/slippage would make fill price non-positive")
     before = _portfolio_state_locked(conn, account)
     state = _clone_state(before)
-    _apply(state, symbol, side, qty, price)
-    report = _risk_report_locked(conn, account, symbol, side, qty, price, before, state)
+    _apply(state, symbol, side, qty, fill_price)
+    report = _risk_report_locked(conn, account, symbol, side, qty, fill_price, before, state)
     if enforce_risk and not report["allowed"]:
         raise SystemExit(f"risk rejected: {report['reason']}")
     if symbol in state["pos"]:
@@ -878,10 +978,12 @@ def place(
     side,
     qty,
     limit,
-    price_fn=live_price,
+    price_fn=None,
     source="cli",
     request_id=None,
 ):
+    if price_fn is None:
+        price_fn = live_price
     source, request_id = _context(source, request_id)
     if side not in ("buy", "sell"):
         raise SystemExit("side must be buy or sell")
@@ -905,6 +1007,9 @@ def place(
     if existing:
         _print_replayed_order(existing)
         return existing["id"]
+    # Validate account early so we don't waste a Yahoo call on a bad account name
+    if not conn.execute("SELECT 1 FROM accounts WHERE name=?", (account,)).fetchone():
+        raise SystemExit(f"no account '{account}' — create it first")
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
     if limit is None:
         price = price_fn(symbol)  # network fetch OUTSIDE the write lock
@@ -1172,10 +1277,12 @@ def submit_order(
     take_profit=None,
     stop_loss=None,
     dry_run=False,
-    price_fn=live_price,
+    price_fn=None,
     source="cli",
     request_id=None,
 ):
+    if price_fn is None:
+        price_fn = live_price
     """Submit an Alpaca-style simulated order with durable lifecycle metadata."""
     source, request_id = _context(source, request_id)
     symbol = (symbol or "").strip().upper()
@@ -1708,10 +1815,12 @@ def close_position(
     symbol,
     qty=None,
     percent=None,
-    price_fn=live_price,
+    price_fn=None,
     source="cli",
     request_id=None,
 ):
+    if price_fn is None:
+        price_fn = live_price
     """Close all or part of a position at market by quantity or percentage."""
     source, request_id = _context(source, request_id)
     symbol = symbol.upper()
@@ -1803,9 +1912,11 @@ def close_position(
 
 
 def close_all_positions(
-    conn, account, price_fn=live_price, source="cli", request_id=None
+    conn, account, price_fn=None, source="cli", request_id=None
 ):
-    """Close every currently open position; each leg remains independently auditable."""
+    if price_fn is None:
+        price_fn = live_price
+    """Close every currently open position; each leg remains independently auditable. Best-effort per symbol."""
     symbols = [
         symbol
         for (symbol,) in conn.execute(
@@ -1816,23 +1927,35 @@ def close_all_positions(
         print("no positions")
         return []
     ids = []
+    errors = []
     for symbol in symbols:
         key = f"{request_id}:{symbol}" if request_id else None
-        ids.append(
-            close_position(
-                conn,
-                account,
-                symbol,
-                price_fn=price_fn,
-                source=source,
-                request_id=key,
+        try:
+            ids.append(
+                close_position(
+                    conn,
+                    account,
+                    symbol,
+                    price_fn=price_fn,
+                    source=source,
+                    request_id=key,
+                )
             )
-        )
-    print(f"closed {len(ids)} positions")
+        except SystemExit as exc:
+            errors.append(f"{symbol}: {exc}")
+            print(f"failed to close {symbol}: {exc}")
+    if errors and not ids:
+        raise SystemExit("; ".join(errors))
+    if errors:
+        print(f"closed {len(ids)}/{len(symbols)} positions; {len(errors)} failed: {'; '.join(errors)}")
+    else:
+        print(f"closed {len(ids)} positions")
     return ids
 
 
-def get_position(conn, account, symbol, price_fn=live_price):
+def get_position(conn, account, symbol, price_fn=None):
+    if price_fn is None:
+        price_fn = live_price
     symbol = symbol.strip().upper()
     row = conn.execute(
         "SELECT qty,avg_cost,mult,asset_class,margin FROM positions"
@@ -1863,19 +1986,50 @@ def get_position(conn, account, symbol, price_fn=live_price):
     }
 
 
-def list_positions(conn, account, price_fn=live_price):
+def list_positions(conn, account, price_fn=None):
+    if price_fn is None:
+        price_fn = live_price
     if not conn.execute("SELECT 1 FROM accounts WHERE name=?", (account,)).fetchone():
         raise SystemExit(f"no account '{account}'")
-    symbols = [
-        symbol
-        for (symbol,) in conn.execute(
-            "SELECT symbol FROM positions WHERE account=? ORDER BY symbol", (account,)
-        )
-    ]
-    return [get_position(conn, account, symbol, price_fn) for symbol in symbols]
+    rows = conn.execute(
+        "SELECT symbol, qty, avg_cost, mult, asset_class, margin FROM positions WHERE account=? ORDER BY symbol",
+        (account,),
+    ).fetchall()
+    if not rows:
+        return []
+    # Batch live marks concurrently instead of one-by-one. Tolerant: if Yahoo fails for one symbol, fall back to avg cost so the rest of the book still renders.
+    symbols = [r[0] for r in rows]
+    try:
+        marks = batch_prices(symbols, price_fn=price_fn, ignore_errors=True)
+    except SystemExit:
+        marks = {}
+    result = []
+    for symbol, qty, avg, mult, asset_class, margin in rows:
+        price = marks.get(symbol)
+        if price is None:
+            price = avg
+        unrealized = qty * mult * (price - avg)
+        market_value = margin + unrealized if asset_class == "future" else qty * mult * price
+        result.append({
+            "account": account,
+            "symbol": symbol,
+            "side": "long" if qty > 0 else "short",
+            "qty": abs(qty),
+            "signed_qty": qty,
+            "avg_entry_price": avg,
+            "current_price": price,
+            "market_value": market_value,
+            "unrealized_pl": unrealized,
+            "asset_class": asset_class,
+            "multiplier": mult,
+            "margin": margin,
+        })
+    return result
 
 
-def option_contract_details(symbol, price_fn=live_price):
+def option_contract_details(symbol, price_fn=None):
+    if price_fn is None:
+        price_fn = live_price
     symbol = symbol.strip().upper()
     root, expiry, strike, kind = parse_occ(symbol)
     result = {
@@ -2040,11 +2194,13 @@ def submit_option_multileg(
     account,
     legs,
     limit_price=None,
-    price_fn=live_price,
+    price_fn=None,
     source="cli",
     request_id=None,
     client_order_id=None,
 ):
+    if price_fn is None:
+        price_fn = live_price
     """Atomically fill a two-to-four-leg option strategy at current mid prices."""
     source, request_id = _context(source, request_id)
     if not isinstance(legs, list) or not 2 <= len(legs) <= 4:
@@ -2239,6 +2395,10 @@ def create_account(
     name = name.strip()
     if not name:
         raise SystemExit("name required")
+    if len(name) > 64:
+        raise SystemExit("account name must be 64 characters or fewer")
+    if any(c in name for c in ("\n", "\r", "\x00")):
+        raise SystemExit("account name contains invalid characters")
     if not math.isfinite(cash) or cash < 0:
         raise SystemExit("starting cash must be a non-negative finite number")
     source, request_id = _context(source, request_id)
@@ -2368,7 +2528,9 @@ def wipe_account(conn, name, reset_cash=None, source="cli", request_id=None):
         print(f"reset '{name}' to {reset_cash:,.2f}")
 
 
-def settle_expired(conn, price_fn=live_price):
+def settle_expired(conn, price_fn=None):
+    if price_fn is None:
+        price_fn = live_price
     # ponytail: settles the day after expiry at that day's spot intrinsic, not expiry-day close.
     today = datetime.now().strftime("%Y-%m-%d")
     rows = conn.execute(
@@ -2526,7 +2688,9 @@ def _linked_after_terminal_locked(conn, order):
         )
 
 
-def tick(conn, price_fn=live_price):
+def tick(conn, price_fn=None):
+    if price_fn is None:
+        price_fn = live_price
     """Advance pending limit, stop, trailing, linked, and auction order state."""
     settle_expired(conn, price_fn)
     columns = (
@@ -2540,11 +2704,13 @@ def tick(conn, price_fn=live_price):
             f"SELECT {columns} FROM orders WHERE status='pending' ORDER BY id"
         ).fetchall()
     ]
+    now = datetime.now(timezone.utc)
+    today = now.date().isoformat()
     for snapshot in pending:
         oid = snapshot["id"]
         if (
             snapshot["time_in_force"] == "day"
-            and snapshot["ts"][:10] < datetime.now(timezone.utc).date().isoformat()
+            and snapshot["ts"][:10] < today
         ):
             with writing(conn):
                 changed = conn.execute(
@@ -2786,9 +2952,12 @@ def search_assets(query, limit=8):
     import yfinance as yf
 
     try:
-        quotes = yf.Search(query, max_results=limit, news_count=0).quotes
+        result = yf.Search(query, max_results=limit, news_count=0)
+        quotes = result.quotes if result and getattr(result, "quotes", None) else []
     except Exception as exc:
         raise SystemExit(f"asset search failed: {exc}") from None
+    if not isinstance(quotes, list):
+        quotes = []
     return [
         {
             "symbol": item.get("symbol"),
@@ -2797,11 +2966,13 @@ def search_assets(query, limit=8):
             "exchange": item.get("exchange") or item.get("exchDisp") or "",
         }
         for item in quotes[:limit]
-        if item.get("symbol")
+        if isinstance(item, dict) and item.get("symbol")
     ]
 
 
-def validate_asset(symbol, price_fn=live_price):
+def validate_asset(symbol, price_fn=None):
+    if price_fn is None:
+        price_fn = live_price
     symbol = symbol.strip().upper()
     if not symbol:
         raise SystemExit("symbol required")
@@ -2983,14 +3154,26 @@ def delete_watchlist(conn, account, name_or_id, source="cli", request_id=None):
     print(f"deleted watchlist '{watchlist['name']}'")
 
 
-def watchlist_quotes(conn, account, name_or_id, price_fn=live_price):
+def watchlist_quotes(conn, account, name_or_id, price_fn=None):
+    if price_fn is None:
+        price_fn = live_price
     watchlist = get_watchlist(conn, account, name_or_id)
+    symbols = watchlist["symbols"]
+    if not symbols:
+        return {**watchlist, "quotes": []}
+    marks = batch_prices(symbols, price_fn=price_fn, ignore_errors=True)
     quotes = []
-    for symbol in watchlist["symbols"]:
-        try:
-            quotes.append({"symbol": symbol, "price": price_fn(symbol), "error": None})
-        except SystemExit as exc:
-            quotes.append({"symbol": symbol, "price": None, "error": str(exc)})
+    for symbol in symbols:
+        price = marks.get(symbol)
+        if price is not None:
+            quotes.append({"symbol": symbol, "price": price, "error": None})
+        else:
+            # Fall back to single fetch for precise error message when batch reports None
+            try:
+                price = price_fn(symbol)
+                quotes.append({"symbol": symbol, "price": price, "error": None})
+            except SystemExit as exc:
+                quotes.append({"symbol": symbol, "price": None, "error": str(exc)})
     return {**watchlist, "quotes": quotes}
 
 
@@ -3034,7 +3217,11 @@ def market_history(
     if not start and not end:
         kwargs["period"] = "1mo" if interval in ("1d", "1wk", "1mo") else "5d"
     try:
-        frame = yf.Ticker(symbol).history(**kwargs).tail(limit)
+        ticker = yf.Ticker(symbol)
+        frame = ticker.history(**kwargs)
+        if frame is None or frame.empty:
+            return {"symbol": symbol, "kind": kind, "timeframe": timeframe, "data": []}
+        frame = frame.tail(limit)
     except Exception as exc:
         raise SystemExit(f"market history failed: {exc}") from None
     rows = []
@@ -3221,6 +3408,61 @@ def trade_history_csv(conn, account, limit=5000):
     return output.getvalue()
 
 
+def export_history(conn, account, limit=5000, fmt="csv"):
+    """Export orders as csv or parquet (requires pyarrow). Returns bytes for parquet, str for csv."""
+    if fmt not in ("csv","parquet"):
+        raise SystemExit("format must be csv or parquet")
+    if fmt == "csv":
+        return trade_history_csv(conn, account, limit)
+    # parquet
+    try:
+        import pandas as pd
+    except ImportError:
+        raise SystemExit("parquet export requires: pip install pyarrow pandas")
+    if not conn.execute("SELECT 1 FROM accounts WHERE name=?", (account,)).fetchone():
+        raise SystemExit(f"no account '{account}'")
+    limit = max(1, min(int(limit), 10000))
+    rows = conn.execute(
+        "SELECT id,ts,side,qty,symbol,order_type,limit_price,stop_price,trail_price,trail_percent,time_in_force,extended_hours,notional,status,filled_price,source,request_id,client_order_id,parent_id,order_class,reject_reason FROM orders WHERE account=? ORDER BY id LIMIT ?", (account, limit)
+    ).fetchall()
+    cols = ["id","ts","side","qty","symbol","order_type","limit_price","stop_price","trail_price","trail_percent","time_in_force","extended_hours","notional","status","filled_price","source","request_id","client_order_id","parent_id","order_class","reject_reason"]
+    df = __import__("pandas").DataFrame(rows, columns=cols)
+    import io
+    buf = io.BytesIO()
+    df.to_parquet(buf, index=False)
+    return buf.getvalue()
+
+def import_history(conn, account, data: bytes, fmt="csv", source="cli", request_id=None):
+    """Import orders from csv/parquet bytes. For simulation restore; does not re-apply fills to positions/cash."""
+    if not conn.execute("SELECT 1 FROM accounts WHERE name=?", (account,)).fetchone():
+        raise SystemExit(f"no account '{account}'")
+    if fmt == "csv":
+        import csv, io
+        reader = csv.DictReader(io.StringIO(data.decode() if isinstance(data, bytes) else data))
+        rows = list(reader)
+    elif fmt == "parquet":
+        try:
+            import pandas as pd, io
+        except ImportError:
+            raise SystemExit("parquet import requires: pip install pyarrow pandas")
+        df = __import__("pandas").read_parquet(io.BytesIO(data) if isinstance(data, bytes) else io.StringIO(data))
+        rows = df.to_dict(orient="records")
+    else:
+        raise SystemExit("format must be csv or parquet")
+    count = 0
+    with writing(conn):
+        for r in rows:
+            try:
+                conn.execute(
+                    "INSERT INTO orders(account,symbol,side,qty,limit_price,status,filled_price,ts,source,request_id,order_type,stop_price,trail_price,trail_percent,time_in_force,extended_hours,notional,client_order_id,parent_id,order_class) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (account, r.get("symbol",""), r.get("side","buy"), float(r.get("qty",0) or 0), r.get("limit_price"), r.get("status","imported"), r.get("filled_price"), r.get("ts") or __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(), source, request_id, r.get("order_type","market"), r.get("stop_price"), r.get("trail_price"), r.get("trail_percent"), r.get("time_in_force","gtc"), int(bool(r.get("extended_hours"))), r.get("notional"), r.get("client_order_id"), r.get("parent_id"), r.get("order_class","simple"))
+                )
+                count += 1
+            except Exception:
+                continue
+    print(f"imported {count} orders into '{account}'")
+    return count
+
 def audit_events(conn, account=None, limit=100, offset=0):
     limit = max(1, min(int(limit), 500))
     offset = max(0, int(offset))
@@ -3312,6 +3554,22 @@ def account_activities(
     return result
 
 
+def list_events(conn, account: str | None = None, since_id: int = 0, limit: int = 100):
+    """Unified recent events for polling/SSE: orders + audit, since audit id."""
+    limit = max(1, min(int(limit), 500))
+    since_id = max(0, int(since_id))
+    # Prefer audit_log as the single source of truth for mutations
+    if account:
+        rows = conn.execute(
+            "SELECT id,ts,source,request_id,action,account,details FROM audit_log WHERE id>? AND (account=? OR account IS NULL) ORDER BY id ASC LIMIT ?", (since_id, account, limit)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id,ts,source,request_id,action,account,details FROM audit_log WHERE id>? ORDER BY id ASC LIMIT ?", (since_id, limit)
+        ).fetchall()
+    # Also include recent pending orders as events for agents polling fills
+    return [{"id": r[0], "ts": r[1], "source": r[2], "request_id": r[3], "action": r[4], "account": r[5], "details": __import__("json").loads(r[6] or "{}")} for r in rows]
+
 def backup_database(conn, directory=None):
     directory = directory or os.path.expanduser("~/.papertrade_backups")
     os.makedirs(directory, exist_ok=True)
@@ -3337,6 +3595,46 @@ def backup_database(conn, directory=None):
     return path
 
 
+def config_list(conn):
+    return dict(conn.execute("SELECT key, value FROM config ORDER BY key").fetchall())
+
+def config_get(conn, key: str):
+    row = conn.execute("SELECT value FROM config WHERE key=?", (key,)).fetchone()
+    if not row:
+        raise SystemExit(f"config key '{key}' not found")
+    return row[0]
+
+def config_set(conn, key: str, value: str, source="cli", request_id=None):
+    key = key.strip()
+    if not key or len(key) > 128 or any(c in key for c in ("\n","\r","\x00")):
+        raise SystemExit("config key must be 1-128 chars without newlines")
+    value = (value or "").strip()
+    if len(value) > 4096:
+        raise SystemExit("config value too long (max 4096)")
+    source, request_id = _context(source, request_id)
+    details = {"key": key, "value": value}
+    with writing(conn):
+        if _idempotent_action(conn, "config.set", key, source, request_id, details):
+            print(f"idempotent replay: config {key}={value}")
+            return value
+        conn.execute("INSERT OR REPLACE INTO config(key,value) VALUES(?,?)", (key, value))
+        _audit_locked(conn, "config.set", key, source, request_id, details)
+    print(f"config {key}={value}")
+    return value
+
+def config_delete(conn, key: str, source="cli", request_id=None):
+    source, request_id = _context(source, request_id)
+    details = {"key": key}
+    with writing(conn):
+        if _idempotent_action(conn, "config.delete", key, source, request_id, details):
+            print(f"idempotent replay: config delete {key}")
+            return
+        cur = conn.execute("DELETE FROM config WHERE key=?", (key,))
+        if not cur.rowcount:
+            raise SystemExit(f"config key '{key}' not found")
+        _audit_locked(conn, "config.delete", key, source, request_id, details)
+    print(f"config deleted '{key}'")
+
 def healthcheck(conn):
     integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
     return {
@@ -3354,11 +3652,13 @@ def healthcheck(conn):
             "SELECT COUNT(*) FROM orders WHERE status='held'"
         ).fetchone()[0],
         "watchlists": conn.execute("SELECT COUNT(*) FROM watchlists").fetchone()[0],
-        "database": DB,
+        "database": _db_path(),
     }
 
 
-def pnl(conn, account, price_fn=live_price):
+def pnl(conn, account, price_fn=None):
+    if price_fn is None:
+        price_fn = live_price
     row = conn.execute(
         "SELECT cash, deposits, realized FROM accounts WHERE name=?", (account,)
     ).fetchone()
@@ -3370,10 +3670,18 @@ def pnl(conn, account, price_fn=live_price):
         " FROM positions WHERE account=?",
         (account,),
     ).fetchall()
+    # Batch marks so 20 positions don't do 20 sequential Yahoo calls
+    marks = batch_prices([r[0] for r in positions], price_fn=price_fn, ignore_errors=True) if positions else {}
     equity, unreal = cash, 0.0
     print(f"{'symbol':<22}{'side':<6}{'qty':>7}{'avg':>11}{'last':>11}{'unreal':>13}")
     for symbol, qty, avg, mult, ac, margin in positions:
-        price = price_fn(symbol)
+        price = marks.get(symbol)
+        if price is None:
+            try:
+                price = price_fn(symbol)
+            except SystemExit as exc:
+                print(f"{symbol:<22}{'':<6}{'':>7}{'':>11}{'':>11}{str(exc)[:13]:>13}")
+                continue
         u = qty * mult * (price - avg)
         unreal += u
         equity += (u + margin) if ac == "future" else qty * mult * price
@@ -3442,8 +3750,10 @@ def batch_prices(symbols, price_fn=None, ignore_errors=False):
         return dict(executor.map(fetch, ordered))
 
 
-def current_equity(conn, account, price_fn=live_price):
+def current_equity(conn, account, price_fn=None):
     """Live mark-to-market equity right now, using current prices."""
+    if price_fn is None:
+        price_fn = live_price
     rows = conn.execute(
         "SELECT a.cash,p.symbol,p.qty,p.avg_cost,p.mult,p.asset_class,p.margin "
         "FROM accounts a LEFT JOIN positions p ON p.account=a.name "
@@ -3605,6 +3915,17 @@ def account_performance(conn, account, closes_fn=_daily_closes, live=True):
     return curve, performance_metrics(curve, cashflows=cashflows)
 
 
+def benchmark_history(symbol: str, start: str, end: str, price_fn=None):
+    """Fetch benchmark closes for perf comparison (e.g. SPY). Returns {date: close}."""
+    if price_fn is not None:
+        # Custom price_fn not useful for benchmark; use _daily_closes
+        pass
+    try:
+        closes = _daily_closes([symbol.upper()], start, end)
+        return closes.get(symbol.upper(), {})
+    except Exception:
+        return {}
+
 def sparkline(values):
     bars = "▁▂▃▄▅▆▇█"
     v = list(values)
@@ -3616,7 +3937,7 @@ def sparkline(values):
     return "".join(bars[min(7, int((x - lo) / (hi - lo) * 7.999))] for x in v)
 
 
-def show_perf(conn, account):
+def show_perf(conn, account, benchmark: str | None = None):
     curve, m = account_performance(conn, account, live=True)
     if not m:
         print(f"{account}: no activity yet")
@@ -3631,6 +3952,14 @@ def show_perf(conn, account):
     print(
         f"maxDD    {m['mdd'] * 100:.2f}%   best {m['best'] * 100:+.2f}%   worst {m['worst'] * 100:+.2f}%"
     )
+    if benchmark:
+        b = benchmark_history(benchmark, m['start'][:10], m['end'][:10])
+        if b and len(b) > 1:
+            b_sorted = sorted(b.items())
+            b_start, b_end = b_sorted[0][1], b_sorted[-1][1]
+            if b_start and b_end:
+                b_ret = (b_end / b_start - 1) * 100
+                print(f"benchmark {benchmark} {b_ret:+.2f}%  alpha {m['total']*100 - b_ret:+.2f}%")
 
 
 def show_chain(root, expiry=None):
@@ -3702,15 +4031,33 @@ CLI_COMMAND_TREE = {
         "tick",
         "doctor",
         "backup",
+        "events",
+        "config",
+        "export",
+        "import",
     ],
+    "aliases": ["positions", "orders", "pnl", "perf"],
+    "shorthands": ["buy", "sell", "close", "cancel", "rm", "reset", "dash"],
+    "research": ["chain", "find", "validate", "quote", "asset"],
 }
 
+
+def _pkg_version():
+    try:
+        from importlib.metadata import version as _v
+        return _v("tradingcli")
+    except Exception:
+        return "0.4.0"
+
+__version__ = _pkg_version()
 
 def _build_parser():
     p = argparse.ArgumentParser(
         prog="tradingcli",
-        epilog="Global automation flags: --json --csv --quiet --schema --help-all",
+        description="Local paper-trading simulator — stocks, futures, options. No live orders.",
+        epilog="Global flags: --json / --csv / --quiet (one at a time), --schema (command tree), --help-all (every subcommand), --version",
     )
+    p.add_argument("--version", action="store_true", help="show version and exit")
     sub = p.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("new", help="create account")
     c.add_argument("name")
@@ -3727,7 +4074,7 @@ def _build_parser():
 
     order = sub.add_parser("order", help="full Alpaca-style order lifecycle")
     order_sub = order.add_subparsers(dest="order_cmd", required=True)
-    submit = order_sub.add_parser("submit")
+    submit = order_sub.add_parser("submit", help="submit an order (Alpaca-style)")
     submit.add_argument("symbol")
     submit.add_argument("--side", choices=["buy", "sell"], required=True)
     amount = submit.add_mutually_exclusive_group(required=True)
@@ -3750,15 +4097,15 @@ def _build_parser():
     submit.add_argument("--idempotency-key")
     submit.add_argument("--dry-run", action="store_true")
     submit.add_argument("-a", "--account")
-    get = order_sub.add_parser("get")
+    get = order_sub.add_parser("get", help="get one order by id or client_order_id")
     target = get.add_mutually_exclusive_group(required=True)
     target.add_argument("--order-id", type=int)
     target.add_argument("--client-order-id")
     get.add_argument("-a", "--account")
-    listing = order_sub.add_parser("list")
+    listing = order_sub.add_parser("list", help="list orders for an account")
     listing.add_argument("-a", "--account")
     listing.add_argument("--status", default="all")
-    replace = order_sub.add_parser("replace")
+    replace = order_sub.add_parser("replace", help="replace a pending order")
     replace.add_argument("order_id", type=int)
     replace.add_argument("--qty", type=float)
     replace.add_argument("--limit-price", type=float)
@@ -3767,10 +4114,10 @@ def _build_parser():
     replace.add_argument("--time-in-force", choices=sorted(TIME_IN_FORCE))
     replace.add_argument("--client-order-id")
     replace.add_argument("--idempotency-key")
-    cancel_one = order_sub.add_parser("cancel")
+    cancel_one = order_sub.add_parser("cancel", help="cancel one pending order")
     cancel_one.add_argument("order_id", type=int)
     cancel_one.add_argument("--idempotency-key")
-    cancel_all = order_sub.add_parser("cancel-all")
+    cancel_all = order_sub.add_parser("cancel-all", help="cancel all pending orders")
     cancel_scope = cancel_all.add_mutually_exclusive_group()
     cancel_scope.add_argument("-a", "--account")
     cancel_scope.add_argument(
@@ -3780,12 +4127,12 @@ def _build_parser():
 
     position = sub.add_parser("position", help="position lookup and liquidation")
     position_sub = position.add_subparsers(dest="position_cmd", required=True)
-    position_sub.add_parser("list").add_argument("-a", "--account")
-    close_all_parser = position_sub.add_parser("close-all")
+    position_sub.add_parser("list", help="list positions").add_argument("-a", "--account")
+    close_all_parser = position_sub.add_parser("close-all", help="flatten every position at market")
     close_all_parser.add_argument("-a", "--account")
     close_all_parser.add_argument("--idempotency-key")
     for command in ("get", "close"):
-        parser = position_sub.add_parser(command)
+        parser = position_sub.add_parser(command, help=f"position {command}")
         parser.add_argument("symbol")
         parser.add_argument("-a", "--account")
         if command == "close":
@@ -3880,21 +4227,29 @@ def _build_parser():
     find = sub.add_parser("find", help="search tradable symbols")
     find.add_argument("query")
     find.add_argument("--limit", type=int, default=8)
-    sub.add_parser("validate").add_argument("symbol")
-    sub.add_parser("quote").add_argument("symbol")
+    sub.add_parser("validate", help="validate a symbol and show live price/class").add_argument("symbol")
+    sub.add_parser("quote", help="live last price for a symbol").add_argument("symbol")
     sub.add_parser("market", help="NYSE status and next open/close")
-    calendar = sub.add_parser("calendar")
+    calendar = sub.add_parser("calendar", help="NYSE trading calendar")
     calendar.add_argument("--start")
     calendar.add_argument("--end")
-    activity = sub.add_parser("activity")
+    activity = sub.add_parser("activity", help="account activity / fills")
     activity.add_argument("-a", "--account")
     activity.add_argument("--type")
     activity.add_argument("--start")
     activity.add_argument("--end")
     activity.add_argument("--limit", type=int, default=100)
-    sub.add_parser("tick")
-    for command in ("positions", "orders", "pnl", "perf"):
-        sub.add_parser(command).add_argument("-a", "--account")
+    ev = sub.add_parser("events", help="unified recent audit/order events for polling/SSE")
+    ev.add_argument("-a", "--account")
+    ev.add_argument("--since-id", type=int, default=0, help="audit id to start after")
+    ev.add_argument("--limit", type=int, default=100)
+    sub.add_parser("tick", help="evaluate pending orders against current prices")
+    sub.add_parser("positions", help="list positions (alias for position list)").add_argument("-a", "--account")
+    sub.add_parser("orders", help="list orders (alias for order list)").add_argument("-a", "--account")
+    sub.add_parser("pnl", help="mark-to-market P&L report").add_argument("-a", "--account")
+    perf_p = sub.add_parser("perf", help="time-weighted performance since inception")
+    perf_p.add_argument("-a", "--account")
+    perf_p.add_argument("--benchmark", help="benchmark symbol e.g. SPY to show alpha")
     backtest = sub.add_parser(
         "backtest", help="backtest the selected portfolio's current open positions"
     )
@@ -3903,49 +4258,75 @@ def _build_parser():
     backtest.add_argument("--end", help="inclusive YYYY-MM-DD")
     backtest.add_argument("--lookback-days", type=int, default=1825)
     backtest.add_argument("--commission-bps", type=float, default=10.0)
-    rename = sub.add_parser("rename")
+    rename = sub.add_parser("rename", help="rename an account")
     rename.add_argument("old")
     rename.add_argument("new")
-    close = sub.add_parser("close")
+    close = sub.add_parser("close", help="close a position (shorthand for position close)")
     close.add_argument("symbol")
     close.add_argument("-a", "--account")
     close.add_argument("--qty", type=float)
     close.add_argument("--percent", type=float)
-    preview = sub.add_parser("preview")
+    preview = sub.add_parser("preview", help="dry-run an order against risk limits")
     preview.add_argument("side", choices=["buy", "sell"])
     preview.add_argument("symbol")
     preview.add_argument("qty", type=float)
     preview.add_argument("--price", type=float)
     preview.add_argument("-a", "--account")
-    risk = sub.add_parser("risk")
+    risk = sub.add_parser("risk", help="show or change risk limits")
     risk.add_argument("-a", "--account")
     risk.add_argument("--allow-short", action=argparse.BooleanOptionalAction)
     risk.add_argument("--allow-naked-options", action=argparse.BooleanOptionalAction)
     risk.add_argument("--max-leverage", type=float)
     risk.add_argument("--max-order", type=float)
     risk.add_argument("--clear-max-order", action="store_true")
-    actions = sub.add_parser("actions")
+    risk.add_argument("--borrow-bps", type=float, help="borrow fee for shorts (bps/day, 0-10000)")
+    risk.add_argument("--commission-bps", type=float, help="commission per fill (bps, 0-10000)")
+    risk.add_argument("--slippage-bps", type=float, help="slippage per fill (bps, 0-10000)")
+    risk.add_argument("--allow-fractional", action=argparse.BooleanOptionalAction, help="allow fractional shares")
+    cfg = sub.add_parser("config", help="get/set/list/delete config keys")
+    cfg_sub = cfg.add_subparsers(dest="config_cmd", required=True)
+    cfg_sub.add_parser("list", help="list all config keys")
+    cfg_get = cfg_sub.add_parser("get", help="get a config value")
+    cfg_get.add_argument("key")
+    cfg_set = cfg_sub.add_parser("set", help="set a config value")
+    cfg_set.add_argument("key")
+    cfg_set.add_argument("value")
+    cfg_set.add_argument("--idempotency-key")
+    cfg_del = cfg_sub.add_parser("delete", help="delete a config key")
+    cfg_del.add_argument("key")
+    cfg_del.add_argument("--idempotency-key")
+
+    actions = sub.add_parser("actions", help="pending corporate actions for an account")
     actions.add_argument("-a", "--account")
-    audit = sub.add_parser("audit")
+    audit = sub.add_parser("audit", help="mutation audit trail")
     audit.add_argument("-a", "--account")
     audit.add_argument("--limit", type=int, default=50)
-    export = sub.add_parser("export")
+    export = sub.add_parser("export", help="export order history as CSV or Parquet")
     export.add_argument("-a", "--account")
     export.add_argument("--limit", type=int, default=5000)
-    sub.add_parser("backup")
-    sub.add_parser("doctor")
-    sub.add_parser("dash")
-    sub.add_parser("cancel").add_argument("order_id", type=int)
-    remove = sub.add_parser("rm")
+    export.add_argument("--format", choices=["csv","parquet"], default="csv", help="output format")
+    export.add_argument("--output", help="output file (default: stdout)")
+    imp = sub.add_parser("import", help="import order history from CSV or Parquet")
+    imp.add_argument("file", help="input file")
+    imp.add_argument("-a", "--account", required=True, help="target account")
+    imp.add_argument("--format", choices=["csv","parquet"], help="input format (auto by extension if omitted)")
+    imp.add_argument("--idempotency-key")
+    sub.add_parser("backup", help="create a DB backup under ~/.papertrade_backups")
+    sub.add_parser("doctor", help="check DB integrity, schema, counts")
+    sub.add_parser("dash", help="launch the live TUI dashboard")
+    sub.add_parser("cancel", help="cancel one pending order (shorthand)").add_argument("order_id", type=int)
+    remove = sub.add_parser("rm", help="delete an account and all its data")
     remove.add_argument("name")
     remove.add_argument("--yes", action="store_true")
-    reset = sub.add_parser("reset")
+    reset = sub.add_parser("reset", help="reset an account to starting cash")
     reset.add_argument("name")
     reset.add_argument("--cash", type=float, default=100_000)
-    for command in ("deposit", "withdraw"):
-        parser = sub.add_parser(command)
-        parser.add_argument("amount", type=float)
-        parser.add_argument("-a", "--account")
+    _dep = sub.add_parser("deposit", help="add cash to an account")
+    _dep.add_argument("amount", type=float)
+    _dep.add_argument("-a", "--account")
+    _wd = sub.add_parser("withdraw", help="remove cash from an account")
+    _wd.add_argument("amount", type=float)
+    _wd.add_argument("-a", "--account")
     return p
 
 
@@ -3991,10 +4372,24 @@ def _emit_mode(mode, output):
 def main(argv=None, _inner=False):
     argv = list(sys.argv[1:] if argv is None else argv)
     if not _inner:
+        if "--version" in argv:
+            print(f"tradingcli {__version__}")
+            return
+        if "--help-all" in argv:
+            parser = _build_parser()
+            parser.print_help()
+            print("\n--- Subcommands ---\n")
+            for cmd in sorted(CLI_COMMAND_TREE.keys()):
+                # Show group, not just top-level cmd
+                ops = CLI_COMMAND_TREE.get(cmd, [])
+                print(f"\n### {cmd}: {', '.join(ops)}\n")
+            # Also show aliases and top-level shorthands
+            print("Aliases: positions→position list, orders→order list, pnl, perf, buy/sell, rm/reset, cancel, close, tick, chain/find/validate/quote/market/calendar/activity/dash")
+            print("\nRun `tradingcli <command> --help` for full flags.")
+            return
         if "--schema" in argv:
             print(json.dumps(CLI_COMMAND_TREE, indent=2))
             return
-        argv = ["--help" if value == "--help-all" else value for value in argv]
         modes = [mode for mode in ("json", "csv", "quiet") if f"--{mode}" in argv]
         if len(modes) > 1:
             raise SystemExit("choose only one of --json, --csv, or --quiet")
@@ -4009,13 +4404,26 @@ def main(argv=None, _inner=False):
                 ):
                     main(cleaned, _inner=True)
             except SystemExit as exc:
-                message = errors.getvalue().strip() or str(exc)
+                # If the inner command already wrote JSON (e.g. `doctor` healthcheck), emit that instead of hiding it behind an error envelope.
+                buffered = buffer.getvalue().strip()
+                if buffered:
+                    try:
+                        json.loads(buffered)
+                        _emit_mode(modes[0], buffered)
+                        raise SystemExit(int(exc.code) if isinstance(exc.code, int) and exc.code not in (0, None) else 1) from None
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                message = errors.getvalue().strip() or str(exc) or f"exit {exc.code}"
                 print(json.dumps({"ok": False, "error": message}), file=sys.stderr)
                 raise SystemExit(1) from None
             _emit_mode(modes[0], buffer.getvalue())
             return
     if not argv:
-        argv = ["dash"]
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            # Don't launch the TUI dashboard when piped/CI — show help instead
+            argv = ["--help"]
+        else:
+            argv = ["dash"]
     args = _build_parser().parse_args(argv)
     _run_cli(args)
 
@@ -4321,8 +4729,9 @@ def _run_cli(args):
                 args.max_leverage,
                 args.max_order,
             )
-            if any(value is not None for value in changes) or args.clear_max_order:
-                set_risk_limits(conn, account, *changes, args.clear_max_order)
+            realism = (args.borrow_bps, args.commission_bps, args.slippage_bps, args.allow_fractional)
+            if any(value is not None for value in changes) or any(value is not None for value in realism) or args.clear_max_order:
+                set_risk_limits(conn, account, *changes, args.clear_max_order, *realism)
             else:
                 print(json.dumps(risk_limits(conn, account), indent=2))
         elif args.cmd == "activity":
@@ -4337,6 +4746,15 @@ def _run_cli(args):
             )
         elif args.cmd == "actions":
             sync_corporate_actions(conn, args.account)
+        elif args.cmd == "config":
+            if args.config_cmd == "list":
+                print(json.dumps(config_list(conn), indent=2))
+            elif args.config_cmd == "get":
+                print(config_get(conn, args.key))
+            elif args.config_cmd == "set":
+                config_set(conn, args.key, args.value, request_id=getattr(args, "idempotency_key", None))
+            elif args.config_cmd == "delete":
+                config_delete(conn, args.key, request_id=getattr(args, "idempotency_key", None))
         elif args.cmd == "audit":
             print(
                 json.dumps(
@@ -4356,25 +4774,53 @@ def _run_cli(args):
                 )
             )
         elif args.cmd == "export":
-            print(
-                trade_history_csv(
-                    conn, resolve_account(conn, args.account), args.limit
-                ),
-                end="",
-            )
+            account = resolve_account(conn, args.account)
+            fmt = getattr(args, "format", "csv")
+            out = getattr(args, "output", None)
+            if fmt == "parquet":
+                data = export_history(conn, account, args.limit, fmt="parquet")
+                if out:
+                    open(out, "wb").write(data)
+                    print(f"wrote {len(data)} bytes to {out}")
+                else:
+                    # Write to stdout as base64 for CLI --json mode? For raw, write bytes
+                    import sys, base64
+                    # If stdout is tty, write file; else write bytes
+                    if sys.stdout.isatty():
+                        print(f"parquet {len(data)} bytes (use --output to write file)")
+                    else:
+                        sys.stdout.buffer.write(data)
+            else:
+                print(
+                    trade_history_csv(
+                        conn, account, args.limit
+                    ),
+                    end="",
+                )
+        elif args.cmd == "import":
+            fmt = args.format or ("parquet" if args.file.endswith(".parquet") else "csv")
+            data = open(args.file, "rb").read()
+            # Decode if csv
+            if fmt == "csv":
+                data = data.decode()
+            import_history(conn, args.account, data, fmt=fmt, request_id=getattr(args, "idempotency_key", None))
         elif args.cmd == "backup":
             print(backup_database(conn))
         elif args.cmd == "doctor":
-            print(json.dumps(healthcheck(conn), indent=2))
+            hc = healthcheck(conn)
+            print(json.dumps(hc, indent=2))
+            # Only fail when DB is behind code (needs migration) or integrity is bad — a DB ahead of code is not degraded (e.g. dev DB with newer schema).
+            if hc.get("status") != "ok" or hc.get("schema_version", 0) < hc.get("expected_schema_version", 0):
+                raise SystemExit(2)
         elif args.cmd == "cancel":
             cancel(conn, args.order_id)
         elif args.cmd == "rm":
-            if (
-                not args.yes
-                and input(f"delete '{args.name}' and all its history? [y/N] ").lower()
-                != "y"
-            ):
-                raise SystemExit("aborted")
+            if not args.yes:
+                # Never block an agent/CI on stdin — require --yes when not interactive
+                if not sys.stdin.isatty():
+                    raise SystemExit("refusing to delete without --yes in non-interactive mode")
+                if input(f"delete '{args.name}' and all its history? [y/N] ").lower() != "y":
+                    raise SystemExit("aborted")
             wipe_account(conn, args.name)
         elif args.cmd == "reset":
             wipe_account(conn, args.name, reset_cash=args.cash)
@@ -4384,6 +4830,9 @@ def _run_cli(args):
                 resolve_account(conn, args.account),
                 args.amount if args.cmd == "deposit" else -args.amount,
             )
+        elif args.cmd == "events":
+            evs = list_events(conn, args.account, since_id=getattr(args, "since_id", 0), limit=getattr(args, "limit", 100))
+            print(json.dumps(evs, indent=2))
         elif args.cmd == "tick":
             tick(conn)
         elif args.cmd in ("positions", "orders", "pnl", "perf"):
@@ -4411,6 +4860,8 @@ def _run_cli(args):
                     )
             elif args.cmd == "pnl":
                 pnl(conn, account)
+            elif getattr(args, "benchmark", None):
+                show_perf(conn, account, benchmark=args.benchmark)
             else:
                 show_perf(conn, account)
     finally:

@@ -1,0 +1,825 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TradingCLI</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4" defer></script>
+<script>
+// Load Chart.js plugins after main library
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src; s.defer = true;
+    s.onload = resolve; s.onerror = () => { console.warn('Failed to load:', src); resolve(); };
+    document.head.appendChild(s);
+  });
+}
+window._chartReady = loadScript('https://cdn.jsdelivr.net/npm/luxon@3')
+  .then(() => loadScript('https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon@1'))
+  .catch(() => {});
+</script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#e6edf3;
+  --muted:#8b949e;--red:#ff2b4a;--green:#00d26a;--blue:#58a6ff;
+  --card:#1c2128;--hover:#21262d;--input-bg:#0d1117;
+}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;
+  background:var(--bg);color:var(--text);min-height:100vh}
+a{color:var(--blue);text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* Layout */
+.app{display:flex;flex-direction:column;height:100vh}
+.topbar{display:flex;align-items:center;justify-content:space-between;
+  padding:12px 24px;border-bottom:1px solid var(--border);background:var(--surface)}
+.logo{font-size:20px;font-weight:700;color:var(--red);letter-spacing:2px}
+.market-status{font-size:13px;color:var(--muted)}
+.market-status .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+.market-status .open .dot{background:var(--green)}
+.market-status .closed .dot{background:var(--muted)}
+.tabs{display:flex;gap:0;border-bottom:1px solid var(--border);background:var(--surface);padding:0 24px}
+.tab{padding:12px 20px;cursor:pointer;font-size:14px;color:var(--muted);
+  border-bottom:2px solid transparent;transition:all .15s}
+.tab:hover{color:var(--text)}
+.tab.active{color:var(--text);border-bottom-color:var(--red)}
+.content{flex:1;overflow-y:auto;padding:24px}
+.panel{display:none}
+.panel.active{display:block}
+
+/* Cards */
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:16px}
+.card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.card-title{font-size:14px;font-weight:600;text-transform:uppercase;color:var(--muted);letter-spacing:1px}
+
+/* Tables */
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;padding:8px 12px;color:var(--muted);font-weight:500;
+  border-bottom:1px solid var(--border);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+td{padding:8px 12px;border-bottom:1px solid var(--border)}
+tr:hover{background:var(--hover)}
+.positive{color:var(--green)}
+.negative{color:var(--red)}
+.muted{color:var(--muted)}
+
+/* Stats row */
+.stats{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:16px}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px;min-width:140px;flex:1}
+.stat-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px}
+.stat-value{font-size:22px;font-weight:600}
+.stat-sub{font-size:12px;color:var(--muted);margin-top:2px}
+
+/* Buttons */
+.btn{padding:8px 16px;border-radius:6px;border:1px solid var(--border);background:var(--surface);
+  color:var(--text);font-size:13px;cursor:pointer;transition:all .15s}
+.btn:hover{background:var(--hover)}
+.btn-red{border-color:var(--red);color:var(--red)}
+.btn-red:hover{background:var(--red);color:#fff}
+.btn-green{border-color:var(--green);color:var(--green)}
+.btn-green:hover{background:var(--green);color:#fff}
+.btn-sm{padding:4px 10px;font-size:12px}
+.btn-group{display:flex;gap:8px;flex-wrap:wrap}
+
+/* Forms */
+.form-row{display:flex;gap:12px;align-items:end;flex-wrap:wrap;margin-bottom:12px}
+.form-group{display:flex;flex-direction:column;gap:4px}
+.form-group label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+input,select{background:var(--input-bg);border:1px solid var(--border);border-radius:6px;
+  padding:8px 12px;color:var(--text);font-size:13px;outline:none;min-width:100px}
+input:focus,select:focus{border-color:var(--red)}
+select{cursor:pointer}
+
+/* Modal */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;
+  align-items:center;justify-content:center;z-index:100}
+.modal-overlay.open{display:flex}
+.modal{background:var(--surface);border:1px solid var(--border);border-radius:12px;
+  padding:24px;min-width:360px;max-width:480px;width:100%}
+.modal h3{margin-bottom:16px;font-size:16px}
+.modal .form-row{margin-bottom:16px}
+.modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:20px}
+
+/* Chart container */
+.chart-wrap{position:relative;height:300px;margin:12px 0}
+.chart-wrap.short{height:200px}
+
+/* Toast */
+.toast{position:fixed;bottom:24px;right:24px;background:var(--surface);border:1px solid var(--border);
+  border-radius:8px;padding:12px 20px;font-size:13px;z-index:200;opacity:0;transition:opacity .3s}
+.toast.show{opacity:1}
+.toast.error{border-color:var(--red);color:var(--red)}
+.toast.success{border-color:var(--green);color:var(--green)}
+
+/* Responsive */
+@media(max-width:768px){
+  .stats{flex-direction:column}
+  .stat{min-width:unset}
+  .form-row{flex-direction:column}
+  input,select{min-width:unset;width:100%}
+  .content{padding:16px}
+  .tabs{overflow-x:auto;padding:0 12px}
+  .tab{padding:10px 14px;white-space:nowrap;font-size:13px}
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="topbar">
+    <div class="logo">TRADINGCLI</div>
+    <div class="market-status" id="marketStatus">
+      <span class="muted">Loading...</span>
+    </div>
+  </div>
+  <div class="tabs" id="tabs">
+    <div class="tab active" data-panel="portfolio">Portfolio</div>
+    <div class="tab" data-panel="orders">Orders</div>
+    <div class="tab" data-panel="watchlists">Watchlists</div>
+    <div class="tab" data-panel="backtest">Backtest</div>
+    <div class="tab" data-panel="settings">Settings</div>
+  </div>
+  <div class="content">
+
+    <!-- PORTFOLIO -->
+    <div class="panel active" id="portfolio">
+      <div class="stats" id="portfolioStats"></div>
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">Positions</span>
+          <div class="btn-group">
+            <button class="btn btn-green btn-sm" onclick="openModal('buyModal')">+ Buy</button>
+            <button class="btn btn-red btn-sm" onclick="openModal('sellModal')">− Sell</button>
+          </div>
+        </div>
+        <table><thead><tr>
+          <th>Symbol</th><th>Side</th><th>Qty</th><th>Avg Cost</th>
+          <th>Price</th><th>Value</th><th>P&L</th><th>P&L %</th><th></th>
+        </tr></thead><tbody id="positionsBody"></tbody></table>
+      </div>
+      <div class="card">
+        <div class="card-header"><span class="card-title">Equity Curve</span></div>
+        <div class="chart-wrap"><canvas id="equityChart"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ORDERS -->
+    <div class="panel" id="orders">
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">Orders</span>
+          <div class="btn-group">
+            <button class="btn btn-sm" onclick="loadOrders()">Refresh</button>
+            <button class="btn btn-red btn-sm" onclick="cancelAllOrders()">Cancel All</button>
+          </div>
+        </div>
+        <div class="form-row" style="margin-bottom:12px">
+          <div class="form-group">
+            <label>Filter</label>
+            <select id="orderFilter" onchange="loadOrders()">
+              <option value="">All</option>
+              <option value="pending">Pending</option>
+              <option value="filled">Filled</option>
+              <option value="canceled">Canceled</option>
+            </select>
+          </div>
+        </div>
+        <table><thead><tr>
+          <th>#</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Type</th>
+          <th>Limit</th><th>Stop</th><th>Status</th><th>Time</th><th></th>
+        </tr></thead><tbody id="ordersBody"></tbody></table>
+      </div>
+    </div>
+
+    <!-- WATCHLISTS -->
+    <div class="panel" id="watchlists">
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">Watchlists</span>
+          <button class="btn btn-sm" onclick="openModal('watchlistModal')">+ New</button>
+        </div>
+        <div id="watchlistsContainer"></div>
+      </div>
+    </div>
+
+    <!-- BACKTEST -->
+    <div class="panel" id="backtest">
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">Portfolio Backtest</span>
+          <div class="btn-group">
+            <select id="btDays">
+              <option value="180">6M</option>
+              <option value="365">1Y</option>
+              <option value="730">2Y</option>
+              <option value="1825">5Y</option>
+              <option value="3650" selected>10Y</option>
+            </select>
+            <button class="btn btn-sm" onclick="runBacktest()">Run</button>
+          </div>
+        </div>
+        <div id="btMetrics" class="stats" style="display:none"></div>
+        <div class="chart-wrap" style="height:350px"><canvas id="btChart"></canvas></div>
+        <div id="btInfo" class="muted" style="font-size:12px;margin-top:8px"></div>
+      </div>
+    </div>
+
+    <!-- SETTINGS -->
+    <div class="panel" id="settings">
+      <div class="card">
+        <div class="card-header"><span class="card-title">Accounts</span></div>
+        <div class="btn-group" style="margin-bottom:12px">
+          <button class="btn btn-sm btn-green" onclick="openModal('newAccountModal')">+ New Account</button>
+        </div>
+        <table><thead><tr>
+          <th>Name</th><th>Cash</th><th>Deposits</th><th>Realized</th><th>Default</th><th></th>
+        </tr></thead><tbody id="accountsBody"></tbody></table>
+      </div>
+      <div class="card">
+        <div class="card-header"><span class="card-title">Risk Limits</span></div>
+        <div id="riskForm" style="display:none">
+          <div class="form-row">
+            <div class="form-group">
+              <label>Account</label>
+              <select id="riskAccount" onchange="loadRisk()"></select>
+            </div>
+            <div class="form-group">
+              <label>Allow Short</label>
+              <select id="riskShort"><option value="1">Yes</option><option value="0">No</option></select>
+            </div>
+            <div class="form-group">
+              <label>Naked Options</label>
+              <select id="riskNaked"><option value="0">No</option><option value="1">Yes</option></select>
+            </div>
+            <div class="form-group">
+              <label>Max Leverage</label>
+              <input type="number" id="riskLeverage" value="2" step="0.5" min="0">
+            </div>
+            <div class="form-group">
+              <label>Max Order Notional</label>
+              <input type="number" id="riskNotional" placeholder="unlimited">
+            </div>
+            <button class="btn btn-sm" onclick="saveRisk()">Save</button>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header"><span class="card-title">Deposit / Withdraw</span></div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Account</label>
+            <select id="cashAccount"></select>
+          </div>
+          <div class="form-group">
+            <label>Amount (+ deposit, − withdraw)</label>
+            <input type="number" id="cashAmount" step="100">
+          </div>
+          <button class="btn btn-sm" onclick="depositCash()">Submit</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Buy Modal -->
+<div class="modal-overlay" id="buyModal">
+  <div class="modal">
+    <h3>Buy Order</h3>
+    <div class="form-row">
+      <div class="form-group"><label>Symbol</label><input id="buySymbol" placeholder="AAPL"></div>
+      <div class="form-group"><label>Qty</label><input type="number" id="buyQty" min="1" step="1"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>Type</label>
+        <select id="buyType">
+          <option value="market">Market</option>
+          <option value="limit">Limit</option>
+          <option value="stop">Stop</option>
+          <option value="stop_limit">Stop Limit</option>
+          <option value="trailing_stop">Trailing Stop</option>
+        </select>
+      </div>
+      <div class="form-group"><label>Limit Price</label><input type="number" id="buyLimit" step="0.01" placeholder="—"></div>
+      <div class="form-group"><label>Stop Price</label><input type="number" id="buyStop" step="0.01" placeholder="—"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Trail %</label><input type="number" id="buyTrail" step="0.5" placeholder="—"></div>
+      <div class="form-group">
+        <label>TIF</label>
+        <select id="buyTif"><option value="gtc">GTC</option><option value="day">Day</option></select>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeModal('buyModal')">Cancel</button>
+      <button class="btn btn-green" onclick="submitOrder('buy')">Buy</button>
+    </div>
+  </div>
+</div>
+
+<!-- Sell Modal -->
+<div class="modal-overlay" id="sellModal">
+  <div class="modal">
+    <h3>Sell Order</h3>
+    <div class="form-row">
+      <div class="form-group"><label>Symbol</label><input id="sellSymbol" placeholder="AAPL"></div>
+      <div class="form-group"><label>Qty</label><input type="number" id="sellQty" min="1" step="1"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>Type</label>
+        <select id="sellType">
+          <option value="market">Market</option>
+          <option value="limit">Limit</option>
+          <option value="stop">Stop</option>
+          <option value="stop_limit">Stop Limit</option>
+          <option value="trailing_stop">Trailing Stop</option>
+        </select>
+      </div>
+      <div class="form-group"><label>Limit Price</label><input type="number" id="sellLimit" step="0.01" placeholder="—"></div>
+      <div class="form-group"><label>Stop Price</label><input type="number" id="sellStop" step="0.01" placeholder="—"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Trail %</label><input type="number" id="sellTrail" step="0.5" placeholder="—"></div>
+      <div class="form-group">
+        <label>TIF</label>
+        <select id="sellTif"><option value="gtc">GTC</option><option value="day">Day</option></select>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeModal('sellModal')">Cancel</button>
+      <button class="btn btn-red" onclick="submitOrder('sell')">Sell</button>
+    </div>
+  </div>
+</div>
+
+<!-- New Account Modal -->
+<div class="modal-overlay" id="newAccountModal">
+  <div class="modal">
+    <h3>New Account</h3>
+    <div class="form-row">
+      <div class="form-group"><label>Name</label><input id="newAcctName" placeholder="main"></div>
+      <div class="form-group"><label>Starting Cash</label><input type="number" id="newAcctCash" value="100000" step="1000"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeModal('newAccountModal')">Cancel</button>
+      <button class="btn btn-green" onclick="createAccount()">Create</button>
+    </div>
+  </div>
+</div>
+
+<!-- Watchlist Modal -->
+<div class="modal-overlay" id="watchlistModal">
+  <div class="modal">
+    <h3>New Watchlist</h3>
+    <div class="form-row">
+      <div class="form-group"><label>Name</label><input id="wlName" placeholder="Tech"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Symbols (comma-separated)</label><input id="wlSymbols" placeholder="AAPL,MSFT,NVDA" style="min-width:280px"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeModal('watchlistModal')">Cancel</button>
+      <button class="btn btn-green" onclick="createWatchlist()">Create</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const $$ = s => document.querySelectorAll(s);
+
+// ---- State ----
+let defaultAccount = null;
+let accounts = [];
+let equityChart = null;
+let btChart = null;
+
+// ---- API ----
+async function api(path, opts = {}) {
+  try {
+    const res = await fetch('/api' + path, {
+      headers: {'Content-Type': 'application/json'},
+      ...opts,
+      body: opts.body ? JSON.stringify(opts.body) : undefined,
+    });
+    const data = await res.json();
+    if (!data.ok) { toast(data.error, 'error'); return null; }
+    return data.data;
+  } catch (e) { toast('Network error: ' + e.message, 'error'); return null; }
+}
+
+// ---- Toast ----
+function toast(msg, type = 'success') {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.className = 'toast show ' + type;
+  setTimeout(() => t.className = 'toast', 3000);
+}
+
+// ---- Tabs ----
+$$('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    $$('.tab').forEach(t => t.classList.remove('active'));
+    $$('.panel').forEach(p => p.classList.remove('active'));
+    tab.classList.add('active');
+    $(`#${tab.dataset.panel}`).classList.add('active');
+    if (tab.dataset.panel === 'orders') loadOrders();
+    if (tab.dataset.panel === 'watchlists') loadWatchlists();
+    if (tab.dataset.panel === 'settings') loadSettings();
+  });
+});
+
+// ---- Modals ----
+function openModal(id) { $(`#${id}`).classList.add('open'); }
+function closeModal(id) { $(`#${id}`).classList.remove('open'); }
+$$('.modal-overlay').forEach(m => {
+  m.addEventListener('click', e => { if (e.target === m) m.classList.remove('open'); });
+});
+
+// ---- Formatters ----
+const fmtPrice = v => v == null ? '—' : Number(v).toFixed(2);
+const escHtml = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+const money = v => v == null ? '—' : (v >= 0 ? '+' : '') + Number(v).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+const moneyClass = v => v == null ? 'muted' : v >= 0 ? 'positive' : 'negative';
+
+// ---- Market Status ----
+async function loadMarketStatus() {
+  const d = await api('/market/status');
+  if (!d) return;
+  const open = d.is_open;
+  const cls = open ? 'open' : 'closed';
+  const dot = open ? '●' : '■';
+  let html = `<span class="${cls}"><span class="dot"></span>${dot} Market ${open ? 'Open' : 'Closed'}</span>`;
+  if (d.next_transition) {
+    html += ` · next ${d.transition} ${d.next_transition.eastern?.slice(11,16) || ''} ET`;
+  }
+  $('#marketStatus').innerHTML = html;
+}
+
+// ---- Config ----
+async function loadConfig() {
+  const d = await api('/config');
+  if (d) defaultAccount = d.default_account;
+}
+
+// ---- Accounts ----
+let ws = null;
+function connectWS() {
+  try {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${proto}//${location.host}/ws`);
+    ws.onmessage = (ev) => {
+      try { const msg = JSON.parse(ev.data); if (msg.type === 'health') { /* could update market status */ } } catch {}
+    };
+    ws.onclose = () => setTimeout(connectWS, 5000);
+  } catch {}
+}
+
+async function loadAccounts() {
+  accounts = await api('/accounts') || [];
+  const s = $('#portfolioStats');
+  if (!accounts.length) {
+    s.innerHTML = '<div class="stat"><div class="stat-value muted">No accounts</div><div class="stat-sub">Create one in Settings</div></div>';
+    return;
+  }
+  const acct = accounts.find(a => a.name === defaultAccount) || accounts[0];
+  s.innerHTML = `
+    <div class="stat"><div class="stat-label">Cash</div><div class="stat-value">$${(acct.cash||0).toLocaleString()}</div></div>
+    <div class="stat"><div class="stat-label">Equity</div><div class="stat-value">$${(acct.equity||0).toLocaleString()}</div></div>
+    <div class="stat"><div class="stat-label">Day P&L</div><div class="stat-value ${moneyClass(acct.day_pnl)}">${money(acct.day_pnl)}</div></div>
+    <div class="stat"><div class="stat-label">Unrealized</div><div class="stat-value ${moneyClass(acct.unrealized_pnl)}">${money(acct.unrealized_pnl)}</div></div>
+    <div class="stat"><div class="stat-label">Realized</div><div class="stat-value ${moneyClass(acct.realized)}">${money(acct.realized)}</div></div>
+    <div class="stat"><div class="stat-label">Total P&L</div><div class="stat-value ${moneyClass(acct.total_pnl)}">${money(acct.total_pnl)} <span style="font-size:14px">(${(acct.return_pct||0).toFixed(1)}%)</span></div></div>
+    <div class="stat" id="alphaStat" style="display:none"><div class="stat-label">Alpha vs SPY</div><div class="stat-value" id="alphaVal">—</div></div>
+  `;
+  // Fetch SPY alpha in background
+  try {
+    const perf = await api('/performance' + (defaultAccount ? `?account=${defaultAccount}&benchmark=SPY` : '?benchmark=SPY'));
+    if (perf && perf.alpha != null) {
+      const el = $('#alphaStat'); const v = $('#alphaVal');
+      if (el && v) { el.style.display = 'block'; v.textContent = `${perf.alpha >=0 ? '+' : ''}${perf.alpha.toFixed(2)}%`; v.className = 'stat-value ' + (perf.alpha >=0 ? 'positive' : 'negative'); }
+    }
+  } catch {}
+}
+
+// ---- Positions ----
+async function loadPositions() {
+  if (!accounts.length) return;
+  const data = await api('/positions');
+  const body = $('#positionsBody');
+  if (!data || !data.length) { body.innerHTML = '<tr><td colspan="9" class="muted">No positions</td></tr>'; return; }
+  body.innerHTML = data.map(p => `<tr>
+    <td><strong>${escHtml(p.symbol)}</strong></td>
+    <td class="${p.side === 'long' ? 'positive' : 'negative'}">${escHtml(p.side.toUpperCase())}</td>
+    <td>${Math.abs(p.qty)}</td>
+    <td>$${fmtPrice(p.avg_cost)}</td>
+    <td>$${fmtPrice(p.current_price)}</td>
+    <td>$${(p.market_value||0).toLocaleString()}</td>
+    <td class="${moneyClass(p.unrealized_pnl)}">${money(p.unrealized_pnl)}</td>
+    <td class="${moneyClass(p.pnl_pct)}">${(p.pnl_pct||0).toFixed(2)}%</td>
+    <td><button class="btn btn-red btn-sm" data-close-symbol="${escHtml(p.symbol)}">Close</button></td>
+  </tr>`).join('');
+  // Delegate close clicks (avoids inline onclick XSS)
+  body.querySelectorAll('[data-close-symbol]').forEach(btn => {
+    btn.addEventListener('click', () => closePosition(btn.dataset.closeSymbol));
+  });
+}
+
+// ---- Equity Curve ----
+async function loadEquity() {
+  const data = await api('/equity-curve');
+  if (!data || !data.length) return;
+  // Chart.js is loaded with defer — wait if not ready yet
+  if (typeof Chart === 'undefined') {
+    if (window._chartReady) await window._chartReady;
+    if (typeof Chart === 'undefined') return;
+  }
+  const ctx = $('#equityChart').getContext('2d');
+  if (equityChart) equityChart.destroy();
+  equityChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: data.map(d => d.date),
+      datasets: [{
+        data: data.map(d => d.equity),
+        borderColor: '#ff2b4a',
+        backgroundColor: 'rgba(255,43,74,0.1)',
+        fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { display: true, grid: { color: '#21262d' }, ticks: { color: '#8b949e', maxTicksLimit: 8, font: { size: 11 } } },
+        y: { grid: { color: '#21262d' }, ticks: { color: '#8b949e', font: { size: 11 }, callback: v => '$' + v.toLocaleString() } }
+      }
+    }
+  });
+}
+
+// ---- Orders ----
+async function loadOrders() {
+  const filter = $('#orderFilter').value;
+  const q = filter ? `?status=${filter}` : '';
+  const data = await api('/orders' + q);
+  const body = $('#ordersBody');
+  if (!data || !data.length) { body.innerHTML = '<tr><td colspan="10" class="muted">No orders</td></tr>'; return; }
+  body.innerHTML = data.map(o => {
+    const statusColor = o.status === 'filled' ? 'positive' : o.status === 'canceled' ? 'muted' : '';
+    return `<tr>
+      <td>${o.id}</td>
+      <td><strong>${escHtml(o.symbol)}</strong></td>
+      <td class="${o.side === 'buy' ? 'positive' : 'negative'}">${o.side.toUpperCase()}</td>
+      <td>${o.qty}</td>
+      <td>${o.order_type}</td>
+      <td>${o.limit_price ? '$' + fmtPrice(o.limit_price) : '—'}</td>
+      <td>${o.stop_price ? '$' + fmtPrice(o.stop_price) : '—'}</td>
+      <td class="${statusColor}">${o.status}</td>
+      <td class="muted">${o.ts ? new Date(o.ts).toLocaleString() : '—'}</td>
+      <td>${o.status === 'pending' ? `<button class="btn btn-red btn-sm" onclick="cancelOrder(${o.id})">✕</button>` : ''}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ---- Watchlists ----
+async function loadWatchlists() {
+  const data = await api('/watchlists');
+  const c = $('#watchlistsContainer');
+  if (!data || !data.length) { c.innerHTML = '<div class="muted">No watchlists</div>'; return; }
+  c.innerHTML = data.map(wl => `
+    <div class="card" style="margin-bottom:12px">
+      <div class="card-header">
+        <span style="font-weight:600">${escHtml(wl.name)}</span>
+        <button class="btn btn-red btn-sm" onclick="deleteWatchlist(${wl.id})">Delete</button>
+      </div>
+      <table><thead><tr><th>Symbol</th><th>Price</th><th>Change</th><th></th></tr></thead>
+      <tbody>${(wl.symbols||[]).map(s => `<tr>
+        <td><strong>${escHtml(s.symbol)}</strong></td>
+        <td>${s.price ? '$' + fmtPrice(s.price) : '—'}</td>
+        <td class="${moneyClass(s.change)}">${s.change_pct != null ? s.change_pct.toFixed(2) + '%' : '—'}</td>
+        <td></td>
+      </tr>`).join('') || '<tr><td colspan="4" class="muted">Empty</td></tr>'}</tbody></table>
+    </div>
+  `).join('');
+}
+
+// ---- Backtest ----
+async function runBacktest() {
+  const days = parseInt($('#btDays').value);
+  const data = await api(`/backtest?days=${days}`);
+  if (!data) return;
+  if (data.status !== 'ok') {
+    $('#btMetrics').style.display = 'none';
+    $('#btInfo').textContent = data.message || 'Backtest unavailable';
+    return;
+  }
+  const m = data.metrics;
+  $('#btMetrics').style.display = 'flex';
+  $('#btMetrics').innerHTML = `
+    <div class="stat"><div class="stat-label">Return</div><div class="stat-value ${moneyClass(m.return_pct)}">${(m.return_pct||0).toFixed(2)}%</div></div>
+    <div class="stat"><div class="stat-label">CAGR</div><div class="stat-value">${(m.cagr_pct||0).toFixed(2)}%</div></div>
+    <div class="stat"><div class="stat-label">Sharpe</div><div class="stat-value">${(m.sharpe||0).toFixed(2)}</div></div>
+    <div class="stat"><div class="stat-label">Sortino</div><div class="stat-value">${(m.sortino||0).toFixed(2)}</div></div>
+    <div class="stat"><div class="stat-label">Max DD</div><div class="stat-value negative">${(m.max_drawdown_pct||0).toFixed(2)}%</div></div>
+    <div class="stat"><div class="stat-label">Volatility</div><div class="stat-value">${(m.annual_volatility_pct||0).toFixed(1)}%</div></div>
+  `;
+  // Chart
+  const curve = data.curve || [];
+  if (typeof Chart === 'undefined') {
+    if (window._chartReady) await window._chartReady;
+    if (typeof Chart === 'undefined') return;
+  }
+  const ctx = $('#btChart').getContext('2d');
+  if (btChart) btChart.destroy();
+  btChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: curve.map(c => c.date),
+      datasets: [{
+        data: curve.map(c => c.equity),
+        borderColor: '#58a6ff',
+        backgroundColor: 'rgba(88,166,255,0.1)',
+        fill: true, tension: 0.2, pointRadius: 0, borderWidth: 2,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { grid: { color: '#21262d' }, ticks: { color: '#8b949e', maxTicksLimit: 10, font: { size: 11 } } },
+        y: { grid: { color: '#21262d' }, ticks: { color: '#8b949e', font: { size: 11 }, callback: v => '$' + v.toLocaleString() } }
+      }
+    }
+  });
+  const syms = (data.symbols||[]).map(s => s.symbol).join(', ');
+  const skip = (data.skipped||[]).map(s => `${s.symbol} (${s.reason})`).join(', ');
+  $('#btInfo').innerHTML = `Universe: ${syms || 'none'}${skip ? '<br>Skipped: ' + skip : ''}`;
+}
+
+// ---- Settings ----
+async function loadSettings() {
+  const body = $('#accountsBody');
+  if (!accounts.length) { body.innerHTML = '<tr><td colspan="6" class="muted">No accounts</td></tr>'; return; }
+  body.innerHTML = accounts.map(a => `<tr>
+    <td><strong>${escHtml(a.name)}</strong> ${a.name === defaultAccount ? '★' : ''}</td>
+    <td>$${(a.cash||0).toLocaleString()}</td>
+    <td>$${(a.deposits||0).toLocaleString()}</td>
+    <td class="${moneyClass(a.realized)}">${money(a.realized)}</td>
+    <td>${a.name === defaultAccount ? '<span class="positive">Default</span>' :
+      `<button class="btn btn-sm" data-set-default="${escHtml(a.name)}">Set Default</button>`}</td>
+    <td><button class="btn btn-red btn-sm" data-delete-account="${escHtml(a.name)}">Delete</button></td>
+  </tr>`).join('');
+  // Delegate settings table actions
+  body.querySelectorAll('[data-set-default]').forEach(b => b.addEventListener('click', () => setDefault(b.dataset.setDefault)));
+  body.querySelectorAll('[data-delete-account]').forEach(b => b.addEventListener('click', () => deleteAccount(b.dataset.deleteAccount)));
+  // Risk form
+  const sel = $('#riskAccount');
+  sel.innerHTML = accounts.map(a => `<option value="${escHtml(a.name)}">${escHtml(a.name)}</option>`).join('');
+  $('#riskForm').style.display = 'block';
+  loadRisk();
+  // Cash form
+  $('#cashAccount').innerHTML = accounts.map(a => `<option value="${a.name}">${a.name}</option>`).join('');
+}
+
+async function loadRisk() {
+  const acct = $('#riskAccount').value;
+  const d = await api(`/risk/${acct}`);
+  if (!d) return;
+  $('#riskShort').value = d.allow_short ? '1' : '0';
+  $('#riskNaked').value = d.allow_naked_options ? '1' : '0';
+  $('#riskLeverage').value = d.max_gross_leverage || 2;
+  $('#riskNotional').value = d.max_order_notional || '';
+}
+
+// ---- Actions ----
+async function submitOrder(side) {
+  const sym = $(`#${side}Symbol`).value.trim().toUpperCase();
+  const qty = parseInt($(`#${side}Qty`).value);
+  if (!sym || !qty) { toast('Symbol and qty required', 'error'); return; }
+  const body = {
+    symbol: sym, qty, side,
+    order_type: $(`#${side}Type`).value,
+    limit_price: parseFloat($(`#${side}Limit`).value) || null,
+    stop_price: parseFloat($(`#${side}Stop`).value) || null,
+    trail_percent: parseFloat($(`#${side}Trail`).value) || null,
+    time_in_force: $(`#${side}Tif`).value,
+  };
+  const res = await api('/orders', { method: 'POST', body });
+  if (res) {
+    toast(`${side.toUpperCase()} order placed for ${sym}`);
+    closeModal(`${side}Modal`);
+    loadOrders();
+  }
+}
+
+async function cancelOrder(id) {
+  await api(`/orders/${id}/cancel`, { method: 'POST' });
+  loadOrders();
+}
+
+async function cancelAllOrders() {
+  if (!confirm('Cancel all pending orders?')) return;
+  await api('/orders/cancel-all', { method: 'POST', body: {} });
+  loadOrders();
+}
+
+async function closePosition(symbol) {
+  if (!symbol) return;
+  if (!confirm(`Close position ${symbol}?`)) return;
+  await api('/positions/close', { method: 'POST', body: { symbol } });
+  toast(`Closed ${symbol}`);
+  refresh();
+}
+
+async function createAccount() {
+  const name = $('#newAcctName').value.trim();
+  const cash = parseFloat($('#newAcctCash').value) || 100000;
+  if (!name) { toast('Name required', 'error'); return; }
+  await api('/accounts', { method: 'POST', body: { name, cash } });
+  toast(`Account "${name}" created`);
+  closeModal('newAccountModal');
+  await loadConfig();
+  refresh();
+}
+
+async function setDefault(name) {
+  await api(`/accounts/${name}/default`, { method: 'POST' });
+  defaultAccount = name;
+  refresh();
+}
+
+async function deleteAccount(name) {
+  if (!confirm(`Delete account "${name}"? This cannot be undone.`)) return;
+  await api(`/accounts/${name}`, { method: 'DELETE' });
+  toast(`Deleted "${name}"`);
+  await loadConfig();
+  refresh();
+}
+
+async function depositCash() {
+  const acct = $('#cashAccount').value;
+  const amount = parseFloat($('#cashAmount').value);
+  if (!acct || !amount) { toast('Select account and enter amount', 'error'); return; }
+  await api(`/accounts/${acct}/deposit`, { method: 'POST', body: { amount } });
+  toast(amount >= 0 ? `Deposited $${amount.toLocaleString()}` : `Withdrew $${Math.abs(amount).toLocaleString()}`);
+  refresh();
+}
+
+async function createWatchlist() {
+  const name = $('#wlName').value.trim();
+  const symbols = $('#wlSymbols').value.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+  if (!name) { toast('Name required', 'error'); return; }
+  await api('/watchlists', { method: 'POST', body: { name, symbols } });
+  toast(`Watchlist "${name}" created`);
+  closeModal('watchlistModal');
+  loadWatchlists();
+}
+
+async function deleteWatchlist(id) {
+  await api(`/watchlists/${id}`, { method: 'DELETE' });
+  loadWatchlists();
+}
+
+async function saveRisk() {
+  const acct = $('#riskAccount').value;
+  await api(`/risk/${acct}`, {
+    method: 'PUT',
+    body: {
+      allow_short: parseInt($('#riskShort').value),
+      allow_naked_options: parseInt($('#riskNaked').value),
+      max_gross_leverage: parseFloat($('#riskLeverage').value),
+      max_order_notional: parseFloat($('#riskNotional').value) || null,
+    }
+  });
+  toast('Risk limits saved');
+}
+
+// ---- Refresh ----
+async function refresh() {
+  await loadAccounts();
+  await loadPositions();
+  loadEquity();
+}
+
+// ---- Init ----
+let _pollersStarted = false;
+async function init() {
+  connectWS();
+  await loadConfig();
+  await loadMarketStatus();
+  await refresh();
+  // Auto-refresh every 15s — pause when no accounts to avoid toast spam (D7)
+  if (!_pollersStarted) {
+    _pollersStarted = true;
+    setInterval(() => { loadMarketStatus(); }, 30000);
+    setInterval(() => { if (accounts.length) refresh(); }, 15000);
+  }
+}
+init();
+</script>
+</body>
+</html>

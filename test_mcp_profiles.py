@@ -73,7 +73,7 @@ if __name__ == "__main__":
         core_names = set(core["names"])
         assert core["profile"] == "core"
         assert core["response_format"] == "json"
-        assert len(core_names) == 54
+        assert len(core_names) == 60
         assert {
             "mcp_catalog",
             "order_submit",
@@ -98,7 +98,7 @@ if __name__ == "__main__":
         advanced_names = set(advanced["names"])
         assert advanced["profile"] == "advanced"
         assert advanced["response_format"] == "json"
-        assert len(advanced_names) == 66
+        assert len(advanced_names) == 72
         assert {"delete_account", "reset_account", "option_exercise"} <= advanced_names
         assert (
             not {
@@ -118,7 +118,7 @@ if __name__ == "__main__":
         full_names = set(full["names"])
         assert full["profile"] == "full"
         assert full["response_format"] == "legacy"
-        assert len(full_names) == 73
+        assert len(full_names) == 79
         assert {"buy", "sell", "cancel_order", "trade_history"} <= full_names
         assert json.loads(full["health"])["status"] == "ok"
 
@@ -131,4 +131,4 @@ if __name__ == "__main__":
         assert legacy_core["response_format"] == "legacy"
         assert json.loads(legacy_core["health"])["status"] == "ok"
 
-    print("MCP profile checks passed (54 core / 66 advanced / 73 full)")
+    print("MCP profile checks passed (60 core / 72 advanced / 79 full)")

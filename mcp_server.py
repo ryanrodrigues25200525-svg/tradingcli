@@ -22,12 +22,17 @@ def _capture(fn, *args, **kw):
     buf = io.StringIO()
     conn = pt.db()
     try:
-        with conn, contextlib.redirect_stdout(buf):
+        with contextlib.redirect_stdout(buf):
             fn(conn, *args, **kw)
     except SystemExit as e:  # papertrade signals user errors via SystemExit
-        return f"error: {e}"
+        out = buf.getvalue().strip()
+        msg = str(e).strip() or "unknown error"
+        return f"{out}\nerror: {msg}".strip() if out else f"error: {msg}"
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
     return buf.getvalue().strip() or "ok"
 
 
@@ -53,9 +58,14 @@ def account_create(
 def account_list() -> str:
     """List all paper accounts and their cash balances."""
     conn = pt.db()
-    rows = conn.execute("SELECT name, cash FROM accounts").fetchall()
-    conn.close()
-    return "\n".join(f"{n}: {c:,.2f}" for n, c in rows) or "no accounts"
+    try:
+        rows = conn.execute("SELECT name, cash FROM accounts").fetchall()
+        return "\n".join(f"{n}: {c:,.2f}" for n, c in rows) or "no accounts"
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 @mcp.tool()
@@ -112,18 +122,23 @@ def tick() -> str:
 def positions(account: str) -> str:
     """List open positions (symbol, side, qty, avg cost, asset class) for an account."""
     conn = pt.db()
-    rows = conn.execute(
-        "SELECT symbol, qty, avg_cost, asset_class FROM positions WHERE account=?",
-        (account,),
-    ).fetchall()
-    conn.close()
-    return (
-        "\n".join(
-            f"{s}: {'long' if q > 0 else 'short'} {abs(q):g} @ {a:.2f} [{ac}]"
-            for s, q, a, ac in rows
+    try:
+        rows = conn.execute(
+            "SELECT symbol, qty, avg_cost, asset_class FROM positions WHERE account=?",
+            (account,),
+        ).fetchall()
+        return (
+            "\n".join(
+                f"{s}: {'long' if q > 0 else 'short'} {abs(q):g} @ {a:.2f} [{ac}]"
+                for s, q, a, ac in rows
+            )
+            or "no positions"
         )
-        or "no positions"
-    )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 @mcp.tool()
@@ -131,13 +146,18 @@ def orders(account: str, limit: int = 100, offset: int = 0) -> str:
     """List paginated order history, including source agent and idempotency key."""
     limit, offset = max(1, min(limit, 500)), max(0, offset)
     conn = pt.db()
-    rows = conn.execute(
-        "SELECT id,ts,side,qty,symbol,order_type,limit_price,stop_price,time_in_force,"
-        "status,filled_price,source,request_id,client_order_id,parent_id,order_class,"
-        "reject_reason FROM orders WHERE account=? ORDER BY id DESC LIMIT ? OFFSET ?",
-        (account, limit, offset),
-    ).fetchall()
-    conn.close()
+    try:
+        rows = conn.execute(
+            "SELECT id,ts,side,qty,symbol,order_type,limit_price,stop_price,time_in_force,"
+            "status,filled_price,source,request_id,client_order_id,parent_id,order_class,"
+            "reject_reason FROM orders WHERE account=? ORDER BY id DESC LIMIT ? OFFSET ?",
+            (account, limit, offset),
+        ).fetchall()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
     out = []
     for (
         oid,
@@ -206,14 +226,19 @@ def summary() -> str:
     """One-line-per-portfolio snapshot for all accounts: cash, equity, unrealized P&L, position count.
     Fast overview for deciding which account to act on."""
     conn = pt.db()
-    accounts = conn.execute(
-        "SELECT name,cash,deposits,realized FROM accounts ORDER BY name"
-    ).fetchall()
-    positions = conn.execute(
-        "SELECT account,symbol,qty,avg_cost,mult,asset_class,margin "
-        "FROM positions ORDER BY account,symbol"
-    ).fetchall()
-    conn.close()
+    try:
+        accounts = conn.execute(
+            "SELECT name,cash,deposits,realized FROM accounts ORDER BY name"
+        ).fetchall()
+        positions = conn.execute(
+            "SELECT account,symbol,qty,avg_cost,mult,asset_class,margin "
+            "FROM positions ORDER BY account,symbol"
+        ).fetchall()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
     positions_by_account: dict[str, list[tuple]] = {name: [] for name, *_ in accounts}
     for account, *position in positions:
         positions_by_account.setdefault(account, []).append(position)
@@ -416,13 +441,21 @@ def market_status() -> str:
 @mcp.tool()
 def watchlist(symbols: str) -> str:
     """Live quotes for a comma-separated list of symbols you don't necessarily hold (research)."""
+    requested = [s.strip().upper() for s in symbols.split(",") if s.strip()][:50]
+    if not requested:
+        return "no symbols"
+    marks = pt.batch_prices(requested, ignore_errors=True)
     out = []
-    for s in [x.strip().upper() for x in symbols.split(",") if x.strip()]:
-        try:
-            out.append(f"{s}: {pt.live_price(s):.2f}")
-        except SystemExit as e:
-            out.append(f"{s}: {e}")
-    return "\n".join(out) or "no symbols"
+    for s in requested:
+        px = marks.get(s)
+        if px is not None:
+            out.append(f"{s}: {px:.2f}")
+        else:
+            try:
+                out.append(f"{s}: {pt.live_price(s):.2f}")
+            except SystemExit as e:
+                out.append(f"{s}: {e}")
+    return "\n".join(out)
 
 
 @mcp.tool()
@@ -698,6 +731,65 @@ def database_backup() -> str:
     finally:
         conn.close()
 
+
+@mcp.tool()
+def config_list() -> str:
+    """List all config keys."""
+    conn = pt.db()
+    try:
+        return json.dumps(pt.config_list(conn), indent=2)
+    finally:
+        conn.close()
+
+@mcp.tool()
+def config_get(key: str) -> str:
+    """Get a config value."""
+    conn = pt.db()
+    try:
+        return json.dumps({"key": key, "value": pt.config_get(conn, key)}, indent=2)
+    except SystemExit as exc:
+        return f"error: {exc}"
+    finally:
+        conn.close()
+
+@mcp.tool()
+def config_set(key: str, value: str, idempotency_key: str | None = None, agent: str = "mcp") -> str:
+    """Set a config value."""
+    return _capture(pt.config_set, key, value, source=agent, request_id=idempotency_key)
+
+@mcp.tool()
+def config_delete(key: str, idempotency_key: str | None = None, agent: str = "mcp") -> str:
+    """Delete a config key."""
+    return _capture(pt.config_delete, key, source=agent, request_id=idempotency_key)
+
+@mcp.tool()
+def events(account: str | None = None, since_id: int = 0, limit: int = 100) -> str:
+    """Poll unified audit/order events since an id. For agents to replace polling with incremental sync."""
+    conn = pt.db()
+    try:
+        return json.dumps(pt.list_events(conn, account, since_id=since_id, limit=limit), indent=2)
+    except SystemExit as exc:
+        return f"error: {exc}"
+    finally:
+        conn.close()
+
+@mcp.tool()
+def quotes_stream(symbols: str, snapshots: int = 3, interval_sec: float = 1.0) -> str:
+    """Poll live quotes N times at an interval; returns list of snapshots for a simple stream without WebSocket."""
+    import time as _time
+    requested = [s.strip().upper() for s in symbols.split(",") if s.strip()][:20]
+    if not requested:
+        return "error: no symbols"
+    snapshots = max(1, min(int(snapshots), 20))
+    interval_sec = max(0.2, min(float(interval_sec), 10))
+    out = []
+    for i in range(snapshots):
+        marks = pt.batch_prices(requested, ignore_errors=True)
+        snap = {"t": i, "quotes": [{"symbol": s, "price": marks.get(s)} for s in requested]}
+        out.append(snap)
+        if i < snapshots - 1:
+            _time.sleep(interval_sec)
+    return json.dumps(out, indent=2)
 
 @mcp.tool()
 def trade_history(account: str, limit: int = 100, offset: int = 0) -> str:
@@ -1262,6 +1354,12 @@ LEGACY_MCP_TOOLS = frozenset(
 CORE_MCP_TOOLS = frozenset(
     {
         "mcp_catalog",
+        "config_list",
+        "config_get",
+        "config_set",
+        "config_delete",
+        "events",
+        "quotes_stream",
         "account_create",
         "account_list",
         "account_details",
@@ -1453,5 +1551,9 @@ def _configure_mcp_catalog():
 _configure_mcp_catalog()
 
 
-if __name__ == "__main__":
+def main():
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()
